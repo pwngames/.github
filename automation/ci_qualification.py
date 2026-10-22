@@ -295,7 +295,7 @@ def find_qualification(api, identity, diagnostics=None):
 def plan(api, identity, paths):
     result = {"schema": 1, "identity": identity, "mode": "full", "reason": "no_valid_qualification"}
     if paths is None:
-        return {**result, "reason": "unknown_change_set"}
+        result["reason"] = "unknown_change_set"
     if docs_only(paths) and len(compact(paths).encode()) <= 4096:
         return {**result, "mode": "docs", "reason": "audited_docs_only", "paths": paths}
     diagnostics = []
@@ -307,7 +307,7 @@ def plan(api, identity, paths):
         diagnostics.append(error.code if isinstance(error, GitHubError) else "qualification_lookup_unavailable")
     if diagnostics:
         result["diagnostics"] = diagnostics[:5]
-    if policy_changed(paths):
+    if paths is not None and policy_changed(paths):
         result["reason"] = "new_policy_without_full_qualification"
     return result
 
@@ -330,8 +330,6 @@ def record(api, identity, selected, results, paths):
     if mode == "docs" and (not docs_only(paths) or paths != selected.get("paths")):
         raise ValueError("Docs classification no longer matches")
     if mode == "reuse":
-        if paths is None:
-            raise ValueError("Unknown change set cannot reuse validation")
         proof = selected.get("proof", {})
         if set(proof) != {"run_id", "attempt", "artifact_id", "checkout_sha"} or not all(type(proof.get(k)) is int and proof[k] > 0 for k in ("run_id", "attempt", "artifact_id")) or not HEX.fullmatch(str(proof.get("checkout_sha", ""))):
             raise ValueError("Invalid qualification proof identifiers")

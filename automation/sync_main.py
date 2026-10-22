@@ -240,12 +240,24 @@ def verify_ci_launch(repo, number, branch, head, prepared):
             raise ValueError('Completed CI has no successful trusted gate; no auto-merge enabled.')
 
 
-def has_trusted_required_gate(repo):
+def has_trusted_required_gate(repo, branch_metadata=None):
     """Classic protection must require a gate bound to the Actions app.
 
-    GraphQL rule metadata is read-only. Inaccessible or missing evidence must
-    never degrade to the less specific branch `protected` flag.
+    Accept explicit app-bound required checks from the already fetched branch
+    payload, or read-only GraphQL rule metadata. A protected flag or context
+    name alone is never sufficient. Missing access leaves a manual PR.
     """
+    def mapping(value):
+        return value if isinstance(value, dict) else {}
+    protection = mapping(mapping(branch_metadata).get('protection'))
+    required = mapping(protection.get('required_status_checks'))
+    checks = required.get('checks')
+    if (protection.get('enabled') is True and required.get('enforcement_level') == 'everyone'
+            and isinstance(checks, list) and any(isinstance(check, dict)
+                    and check.get('context') in ('ci-gate', 'verify')
+                    and type(check.get('app_id')) is int and check.get('app_id') == 15368
+                    for check in checks)):
+        return True
     owner, name = repo.split('/')
     query = """query($owner: String!, $name: String!) {
       repository(owner: $owner, name: $name) {
@@ -255,15 +267,24 @@ def has_trusted_required_gate(repo):
         } }
       }
     }"""
-    result = api('graphql', '-f', 'query=' + query, '-f', 'owner=' + owner, '-f', 'name=' + name)
-    if result.get('errors'):
-        raise ValueError('Required gate protection could not be verified.')
-    rule = (((result.get('data') or {}).get('repository') or {}).get('ref') or {}).get('branchProtectionRule') or {}
-    return rule.get('requiresStatusChecks') is True and any(
-        check.get('context') in ('ci-gate', 'verify')
-        and (check.get('app') or {}).get('databaseId') == 15368
-        and (check.get('app') or {}).get('slug') == 'github-actions'
-        for check in rule.get('requiredStatusChecks', []))
+    try:
+        result = api('graphql', '-f', 'query=' + query, '-f', 'owner=' + owner, '-f', 'name=' + name)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        print('::notice::Required gate metadata is unavailable; synchronization requires manual merge.')
+        return False
+    if not isinstance(result, dict) or result.get('errors'):
+        print('::notice::Required gate metadata is unavailable; synchronization requires manual merge.')
+        return False
+    rule = result
+    for key in ('data', 'repository', 'ref', 'branchProtectionRule'):
+        rule = mapping(rule.get(key))
+    checks = rule.get('requiredStatusChecks')
+    return rule.get('requiresStatusChecks') is True and isinstance(checks, list) and any(
+        isinstance(check, dict) and check.get('context') in ('ci-gate', 'verify')
+        and type(mapping(check.get('app')).get('databaseId')) is int
+        and mapping(check.get('app')).get('databaseId') == 15368
+        and mapping(check.get('app')).get('slug') == 'github-actions'
+        for check in checks)
 
 
 def merged_state(pull):
@@ -282,7 +303,7 @@ def protected_auto_merge(repo, number, branch, head, *, main_sha):
         print('::notice::Sync PR requires manual merge: protected merge-commit auto-merge is not enabled.')
         return 'manual_merge_required'
     branch_metadata = api(f'repos/{repo}/branches/develop')
-    if not branch_metadata.get('protected') or not has_trusted_required_gate(repo):
+    if not branch_metadata.get('protected') or not has_trusted_required_gate(repo, branch_metadata):
         print('::notice::Sync PR requires manual merge: no verified required Actions gate on develop.')
         return 'manual_merge_required'
     # Recheck immutable PR bindings and the real branch immediately before the
@@ -314,8 +335,10 @@ def protected_auto_merge(repo, number, branch, head, *, main_sha):
             raise ValueError('Remote sync head moved before protected merge.')
         if api(f'repos/{repo}/git/ref/heads/main')['object']['sha'] != main_sha:
             return 'superseded'
-        if not api(f'repos/{repo}/branches/develop').get('protected') or not has_trusted_required_gate(repo):
-            raise ValueError('Required protection changed before protected merge.')
+        branch_metadata = api(f'repos/{repo}/branches/develop')
+        if not branch_metadata.get('protected') or not has_trusted_required_gate(repo, branch_metadata):
+            print('::notice::Required gate metadata is unavailable or changed; synchronization requires manual merge.')
+            return 'manual_merge_required'
         checks = api(f'repos/{repo}/commits/{head}/check-runs?per_page=100')['check_runs']
         if not any(check.get('head_sha') == head and check.get('name') in ('ci-gate', 'verify')
                 and check.get('conclusion') == 'success'
