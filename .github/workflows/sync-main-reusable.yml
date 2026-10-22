@@ -28,7 +28,7 @@ permissions:
 jobs:
   synchronize:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 45
     concurrency:
       group: protected-main-develop-sync-${{ github.repository }}
       cancel-in-progress: false

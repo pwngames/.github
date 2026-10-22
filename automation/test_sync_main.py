@@ -30,13 +30,13 @@ class PolicyTests(unittest.TestCase):
             self.assertIsNone(sync.source_sha('pwngames/app','deliver.yml','12',receipt=True))
 
     def test_no_auto_merge_without_verified_protections(self):
-        for settings,protection in [({'allow_auto_merge':False},{}),({'allow_auto_merge':True,'allow_merge_commit':True},{}),({'allow_auto_merge':True,'allow_merge_commit':True},{'required_status_checks':{'contexts':['ci-gate']},'required_linear_history':{'enabled':True}})]:
+        for settings,protection in [({'allow_auto_merge':False},{}),({'allow_auto_merge':True,'allow_merge_commit':True},{}),({'allow_auto_merge':True,'allow_merge_commit':True},{'protected':False})]:
             with patch.object(sync,'api',side_effect=[settings,protection]),patch.object(sync,'command') as command:
                 self.assertFalse(sync.protected_auto_merge('pwngames/app',1,'a'*40))
                 command.assert_not_called()
 
     def test_auto_merge_matches_head_without_bypass(self):
-        with patch.object(sync,'api',side_effect=[{'allow_auto_merge':True,'allow_merge_commit':True},{'required_status_checks':{'contexts':['ci-gate']}}]),patch.object(sync,'command') as command:
+        with patch.object(sync,'api',side_effect=[{'allow_auto_merge':True,'allow_merge_commit':True},{'protected':True},{'head':{'sha':'a'*40},'base':{'ref':'develop'}}]),patch.object(sync,'command') as command:
             self.assertTrue(sync.protected_auto_merge('pwngames/app',1,'a'*40))
             self.assertEqual(command.call_args.args,('gh','pr','merge','1','--repo','pwngames/app','--auto','--merge','--match-head-commit','a'*40))
 
@@ -104,7 +104,8 @@ class AdditionalSafetyTests(HistoryTests):
 
     def test_absent_protection_is_manual_only(self):
         with patch.object(sync,'api',side_effect=[{'allow_auto_merge':True,'allow_merge_commit':True},subprocess.CalledProcessError(1,['gh'],stderr='HTTP 404')]),patch.object(sync,'command') as command:
-            self.assertFalse(sync.protected_auto_merge('pwngames/app',1,'a'*40))
+            with self.assertRaises(subprocess.CalledProcessError):
+                sync.protected_auto_merge('pwngames/app',1,'a'*40)
             command.assert_not_called()
 
 
@@ -118,3 +119,24 @@ class AdditionalSafetyTests(HistoryTests):
         self.assertNotEqual(current,old)
         self.assertEqual((self.work/'later-feature').read_text(),'keep this')
         self.assertEqual(sync.sync_branch(self.work,self.main),(branch,current))
+
+
+class DispatchProofTests(unittest.TestCase):
+    def run_proof(self, changes=None, jobs=None):
+        run=dict(id=12,head_sha='a'*40,head_branch='sync/main-to-develop-aaaaaaaaaaaa',event='workflow_dispatch',path='.github/workflows/ci.yml',status='completed',conclusion='success')
+        run.update(changes or {})
+        return patch.object(sync,'api',side_effect=[{'workflow_runs':[run]},{'jobs':jobs if jobs is not None else [{'name':'ci-gate','conclusion':'success'}]}])
+
+    def test_successful_exact_head_dispatch_qualifies(self):
+        with self.run_proof():
+            self.assertEqual(sync.wait_for_dispatched_ci('pwngames/app','sync/main-to-develop-aaaaaaaaaaaa','a'*40),12)
+
+    def test_failed_dispatch_and_missing_gate_fail_closed(self):
+        for changes,jobs in [({'conclusion':'failure'},None),({},[{'name':'ci-gate','conclusion':'skipped'}])]:
+            with self.run_proof(changes,jobs),self.assertRaises(ValueError):
+                sync.wait_for_dispatched_ci('pwngames/app','sync/main-to-develop-aaaaaaaaaaaa','a'*40)
+
+    def test_pr_head_change_prevents_auto_merge(self):
+        with patch.object(sync,'api',side_effect=[{'allow_auto_merge':True,'allow_merge_commit':True},{'protected':True},{'head':{'sha':'b'*40},'base':{'ref':'develop'}}]),patch.object(sync,'command') as command,self.assertRaises(ValueError):
+            sync.protected_auto_merge('pwngames/app',1,'a'*40)
+        command.assert_not_called()
