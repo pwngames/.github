@@ -1,0 +1,60 @@
+name: Validate and record CI qualification
+description: Validate all expected job outcomes and record only full successful qualification.
+inputs:
+  profile:
+    description: Same profile as ci-plan.
+    required: true
+  validation-context:
+    description: Same validation context as ci-plan.
+    required: true
+  expected-jobs:
+    description: Same exhaustive JSON job-id array as ci-plan.
+    required: true
+  workflow-path:
+    description: Validation policy workflow path.
+    default: .github/workflows/ci.yml
+  trusted-workflows:
+    description: Trusted run entrypoints; defaults to workflow-path.
+    default: '[]'
+  gate-name:
+    description: Exact required aggregate Actions job name.
+    default: ci-gate
+  gate-names:
+    description: Optional JSON mapping of every trusted entrypoint to its exact gate job name.
+    default: '{}'
+  implementation-ref:
+    description: Same immutable reference as the action uses and ci-plan.
+    required: true
+  plan:
+    description: Exact ci-plan JSON output.
+    required: true
+  results:
+    description: toJSON(needs), containing successful plan and every expected job.
+    required: true
+runs:
+  using: composite
+  steps:
+    - id: record
+      shell: bash
+      env:
+        CI_ACTION_REF: ${{ github.action_ref }}
+        CI_PROFILE: ${{ inputs.profile }}
+        CI_VALIDATION_CONTEXT: ${{ inputs.validation-context }}
+        CI_EXPECTED_JOBS: ${{ inputs.expected-jobs }}
+        CI_WORKFLOW_PATH: ${{ inputs.workflow-path }}
+        CI_TRUSTED_WORKFLOWS: ${{ inputs.trusted-workflows }}
+        CI_GATE_NAMES: ${{ inputs.gate-names }}
+        CI_GATE_NAME: ${{ inputs.gate-name }}
+        CI_IMPLEMENTATION_REF: ${{ inputs.implementation-ref }}
+        CI_PLAN: ${{ inputs.plan }}
+        CI_RESULTS: ${{ inputs.results }}
+        GH_TOKEN: ${{ github.token }}
+      run: python3 "$GITHUB_ACTION_PATH/../../automation/ci_qualification.py" record
+    - name: Retain full validation receipt
+      if: steps.record.outputs.full == 'true'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: ${{ steps.record.outputs.artifact }}
+        path: ${{ steps.record.outputs.file }}
+        if-no-files-found: error
+        retention-days: 14

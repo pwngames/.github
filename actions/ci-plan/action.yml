@@ -1,0 +1,57 @@
+name: Plan qualified CI
+description: Classify audited documentation or verify full qualification of this exact checkout tree.
+inputs:
+  profile:
+    description: Immutable validation toolchain/platform/profile identifier.
+    required: true
+  validation-context:
+    description: Build environment and mode fingerprint; identical only for equivalent validation.
+    required: true
+  expected-jobs:
+    description: JSON array of every heavy job id required by this profile (excluding plan).
+    required: true
+  workflow-path:
+    description: Validation policy workflow path.
+    default: .github/workflows/ci.yml
+  trusted-workflows:
+    description: JSON array of trusted run entrypoints; defaults to workflow-path.
+    default: '[]'
+  gate-name:
+    description: Exact source Actions job name for the required aggregate gate.
+    default: ci-gate
+  gate-names:
+    description: Optional JSON mapping of every trusted entrypoint to its exact gate job name.
+    default: '{}'
+  implementation-ref:
+    description: Same immutable 40-character commit as the action uses reference.
+    required: true
+outputs:
+  mode:
+    description: full, docs or reuse.
+    value: ${{ steps.plan.outputs.mode }}
+  tree:
+    description: Actual checkout Git tree.
+    value: ${{ steps.plan.outputs.tree }}
+  checkout-sha:
+    description: Actual checkout commit, including PR synthetic merge commits.
+    value: ${{ steps.plan.outputs.checkout-sha }}
+  plan:
+    description: Bound classification/proof JSON for the always-reporting aggregate gate.
+    value: ${{ steps.plan.outputs.plan }}
+runs:
+  using: composite
+  steps:
+    - id: plan
+      shell: bash
+      env:
+        CI_ACTION_REF: ${{ github.action_ref }}
+        CI_PROFILE: ${{ inputs.profile }}
+        CI_VALIDATION_CONTEXT: ${{ inputs.validation-context }}
+        CI_EXPECTED_JOBS: ${{ inputs.expected-jobs }}
+        CI_WORKFLOW_PATH: ${{ inputs.workflow-path }}
+        CI_TRUSTED_WORKFLOWS: ${{ inputs.trusted-workflows }}
+        CI_GATE_NAMES: ${{ inputs.gate-names }}
+        CI_GATE_NAME: ${{ inputs.gate-name }}
+        CI_IMPLEMENTATION_REF: ${{ inputs.implementation-ref }}
+        GH_TOKEN: ${{ github.token }}
+      run: python3 "$GITHUB_ACTION_PATH/../../automation/ci_qualification.py" plan
