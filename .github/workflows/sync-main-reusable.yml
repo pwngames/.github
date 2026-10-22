@@ -20,6 +20,16 @@ on:
       find-production-run:
         type: boolean
         default: false
+    outputs:
+      state:
+        description: Verified result; awaiting_checks is queued native auto-merge, not a merged PR.
+        value: ${{ jobs.synchronize.outputs.state }}
+      pull-request-url:
+        value: ${{ jobs.synchronize.outputs.pull_request_url }}
+      head-sha:
+        value: ${{ jobs.synchronize.outputs.head_sha }}
+      ci-run-id:
+        value: ${{ jobs.synchronize.outputs.ci_run_id }}
     secrets:
       sync-token:
         required: false
@@ -28,7 +38,12 @@ permissions:
 jobs:
   synchronize:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 10
+    outputs:
+      state: ${{ steps.synchronize.outputs.state }}
+      pull_request_url: ${{ steps.synchronize.outputs.pull_request_url }}
+      head_sha: ${{ steps.synchronize.outputs.head_sha }}
+      ci_run_id: ${{ steps.synchronize.outputs.ci_run_id }}
     concurrency:
       group: protected-main-develop-sync-${{ github.repository }}
       cancel-in-progress: false
@@ -51,7 +66,8 @@ jobs:
           fetch-depth: 0
           path: repository
           token: ${{ secrets.sync-token || github.token }}
-      - name: Open protected synchronization PR and trigger its CI
+      - name: Queue protected synchronization without waiting for CI completion
+        id: synchronize
         env:
           GH_TOKEN: ${{ secrets.sync-token || github.token }}
           SOURCE_WORKFLOW: ${{ inputs.source-workflow }}
