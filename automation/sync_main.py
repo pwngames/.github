@@ -123,7 +123,54 @@ def sync_branch(repo, main_sha):
     return branch, git(repo, 'rev-parse', 'HEAD')
 
 
-def wait_for_dispatched_ci(repo, branch, head, *, timeout=2100):
+def prepare_owned_pr_ci(repo, number, branch, head, *, timeout=60):
+    """Approve only CI for this verified synthetic-history PR, never foreign runs.
+
+    Called only after sync_branch has proven every sync-only commit is a clean
+    two-parent merge of protected main/develop history. Repository GITHUB_TOKEN
+    may approve its own generated PR workflow without changing approval policy.
+    """
+    import time
+    pull = api(f'repos/{repo}/pulls/{number}')
+    if (pull.get('state') != 'open' or pull.get('head', {}).get('sha') != head
+            or pull.get('head', {}).get('ref') != branch
+            or pull.get('head', {}).get('repo', {}).get('full_name') != repo
+            or pull.get('base', {}).get('ref') != 'develop'
+            or not re.fullmatch(r'sync/main-to-develop-[a-f0-9]{12}', branch)):
+        raise ValueError('PR does not match the verified owned history merge.')
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        runs = api(f'repos/{repo}/actions/workflows/ci.yml/runs?branch={branch}&event=pull_request&head_sha={head}&per_page=20')['workflow_runs']
+        for run in runs:
+            if (run.get('head_sha') != head or run.get('head_branch') != branch
+                    or run.get('path') != '.github/workflows/ci.yml' or run.get('event') != 'pull_request'
+                    or run.get('head_repository', {}).get('full_name') != repo):
+                continue
+            linked = any(item.get('number') == number and item.get('head', {}).get('sha') == head
+                         and item.get('head', {}).get('ref') == branch
+                         and item.get('base', {}).get('ref') == 'develop' for item in run.get('pull_requests', []))
+            if not linked:
+                continue
+            if run.get('conclusion') == 'action_required':
+                if (pull.get('user', {}).get('login') != 'github-actions[bot]'
+                        or run.get('actor', {}).get('login') != 'github-actions[bot]'):
+                    raise ValueError('Refusing to approve CI that was not created by the sync bot.')
+                # Re-read the current PR immediately before approval; a queued
+                # workflow may have appeared after the head was moved.
+                current = api(f'repos/{repo}/pulls/{number}')
+                if (current.get('state') != 'open' or current.get('head', {}).get('sha') != head
+                        or current.get('head', {}).get('ref') != branch
+                        or current.get('head', {}).get('repo', {}).get('full_name') != repo
+                        or current.get('base', {}).get('ref') != 'develop'
+                        or current.get('user', {}).get('login') != 'github-actions[bot]'):
+                    raise ValueError('Sync PR moved before approval; refusing queued CI approval.')
+                api(f"repos/{repo}/actions/runs/{run['id']}/approve", '--method', 'POST')
+            return run['id']
+        time.sleep(5)
+    return None
+
+
+def wait_for_dispatched_ci(repo, branch, head, *, timeout=2100, event="workflow_dispatch", run_id=None):
     """Only a successful real CI dispatch on the exact owned head qualifies.
 
     PR-event runs created by GITHUB_TOKEN may need human approval. Explicit
@@ -132,12 +179,13 @@ def wait_for_dispatched_ci(repo, branch, head, *, timeout=2100):
     import time
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        runs = api(f'repos/{repo}/actions/workflows/ci.yml/runs?branch={branch}&event=workflow_dispatch&head_sha={head}&per_page=20')['workflow_runs']
+        runs = api(f'repos/{repo}/actions/workflows/ci.yml/runs?branch={branch}&event={event}&head_sha={head}&per_page=20')['workflow_runs']
         candidates = [run for run in runs if run.get('head_sha') == head and run.get('head_branch') == branch
-                      and run.get('event') == 'workflow_dispatch' and run.get('path') == '.github/workflows/ci.yml']
+                      and run.get('event') == event and run.get('path') == '.github/workflows/ci.yml'
+                      and (run_id is None or run.get('id') == run_id)]
         if candidates:
             run = candidates[0]
-            if run['status'] == 'completed':
+            if run['status'] == 'completed' and run.get('conclusion') != 'action_required':
                 if run.get('conclusion') != 'success':
                     raise ValueError('Dispatched synchronization CI did not succeed; no auto-merge enabled.')
                 jobs = api(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")['jobs']
@@ -216,10 +264,12 @@ def run(args):
         number = pull['number']
     # GITHUB_TOKEN suppresses PR event workflows. workflow_dispatch is the supported
     # explicit trigger and validates exactly this sync branch without deploying it.
-    command('gh', 'workflow', 'run', 'ci.yml', '--repo', repo, '--ref', branch)
+    ci_run = prepare_owned_pr_ci(repo, number, branch, head)
+    if ci_run is None:
+        command('gh', 'workflow', 'run', 'ci.yml', '--repo', repo, '--ref', branch)
     current = api(f'repos/{repo}/git/ref/heads/main')['object']['sha']
     if current == sha and args.auto_merge:
-        wait_for_dispatched_ci(repo, branch, head)
+        wait_for_dispatched_ci(repo, branch, head, event='pull_request' if ci_run else 'workflow_dispatch', run_id=ci_run)
         if api(f'repos/{repo}/git/ref/heads/main')['object']['sha'] != sha:
             print('Newer main superseded this validated sync PR; no auto-merge enabled.')
             return
