@@ -1,0 +1,20 @@
+name: Synchronize production into develop
+on:
+  push:
+    branches: [main, develop]
+permissions:
+  contents: read
+jobs:
+  synchronize:
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    uses: pwngames/.github/.github/workflows/sync-main-reusable.yml@796d389f1d338de87dd3cb716fabf98658b5f6d1
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    with:
+      implementation-ref: 796d389f1d338de87dd3cb716fabf98658b5f6d1
+      find-production-run: ${{ github.event_name == 'push' && github.ref_name == 'develop' }}
+      source-sha: ${{ github.sha }}
+    secrets:
+      sync-token: ${{ secrets.RELEASE_PLEASE_TOKEN }}

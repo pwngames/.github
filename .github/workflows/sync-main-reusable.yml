@@ -1,0 +1,66 @@
+name: Synchronize deployed main history
+on:
+  workflow_call:
+    inputs:
+      implementation-ref:
+        type: string
+        required: true
+      source-workflow:
+        type: string
+        default: ci.yml
+      source-run-id:
+        type: string
+        default: ''
+      source-sha:
+        type: string
+        default: ''
+      require-receipt:
+        type: boolean
+        default: false
+      find-production-run:
+        type: boolean
+        default: false
+    secrets:
+      sync-token:
+        required: false
+permissions:
+  contents: read
+jobs:
+  synchronize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: protected-main-develop-sync-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Check out trusted automation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: pwngames/.github
+          ref: ${{ inputs.implementation-ref }}
+          path: sync-automation
+          persist-credentials: false
+      - name: Check out repository history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          path: repository
+          token: ${{ secrets.sync-token || github.token }}
+      - name: Open protected synchronization PR and trigger its CI
+        env:
+          GH_TOKEN: ${{ secrets.sync-token || github.token }}
+          SOURCE_WORKFLOW: ${{ inputs.source-workflow }}
+          SOURCE_RUN_ID: ${{ inputs.source-run-id }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          FIND_PRODUCTION_RUN: ${{ inputs.find-production-run }}
+          REQUIRE_RECEIPT: ${{ inputs.require-receipt }}
+        run: |
+          arguments=(--workflow "$SOURCE_WORKFLOW" --run-id "$SOURCE_RUN_ID" --sha "$SOURCE_SHA" --auto-merge)
+          if [[ "$REQUIRE_RECEIPT" == true ]]; then arguments+=(--receipt); fi
+          if [[ "$FIND_PRODUCTION_RUN" == true ]]; then arguments+=(--find-production-run); fi
+          python3 sync-automation/automation/sync_main.py "${arguments[@]}"
