@@ -123,6 +123,30 @@ def sync_branch(repo, main_sha):
     return branch, git(repo, 'rev-parse', 'HEAD')
 
 
+def read_owned_pull(repo, number, branch, head, *, attempts=15):
+    """Wait only for stale PR head metadata after a proven remote branch push.
+
+    Immutable binding changes fail immediately. A genuinely moved remote head
+    also fails immediately; no foreign or stale-head workflow is approved.
+    """
+    import time
+    for attempt in range(attempts):
+        pull = api(f'repos/{repo}/pulls/{number}')
+        if (pull.get('state') != 'open' or pull.get('head', {}).get('ref') != branch
+                or pull.get('head', {}).get('repo', {}).get('full_name') != repo
+                or pull.get('base', {}).get('ref') != 'develop'
+                or not re.fullmatch(r'sync/main-to-develop-[a-f0-9]{12}', branch)):
+            raise ValueError('PR does not match the verified owned history merge.')
+        if pull.get('head', {}).get('sha') == head:
+            return pull
+        remote = api(f'repos/{repo}/git/ref/heads/{branch}')
+        if remote.get('object', {}).get('sha') != head:
+            raise ValueError('Remote sync head moved; refusing stale PR approval.')
+        if attempt + 1 < attempts:
+            time.sleep(2)
+    raise ValueError('PR head metadata did not converge to the verified remote head.')
+
+
 def prepare_owned_pr_ci(repo, number, branch, head, *, timeout=60):
     """Approve only CI for this verified synthetic-history PR, never foreign runs.
 
@@ -131,13 +155,7 @@ def prepare_owned_pr_ci(repo, number, branch, head, *, timeout=60):
     may approve its own generated PR workflow without changing approval policy.
     """
     import time
-    pull = api(f'repos/{repo}/pulls/{number}')
-    if (pull.get('state') != 'open' or pull.get('head', {}).get('sha') != head
-            or pull.get('head', {}).get('ref') != branch
-            or pull.get('head', {}).get('repo', {}).get('full_name') != repo
-            or pull.get('base', {}).get('ref') != 'develop'
-            or not re.fullmatch(r'sync/main-to-develop-[a-f0-9]{12}', branch)):
-        raise ValueError('PR does not match the verified owned history merge.')
+    pull = read_owned_pull(repo, number, branch, head)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         runs = api(f'repos/{repo}/actions/workflows/ci.yml/runs?branch={branch}&event=pull_request&head_sha={head}&per_page=20')['workflow_runs']
@@ -157,13 +175,12 @@ def prepare_owned_pr_ci(repo, number, branch, head, *, timeout=60):
                     raise ValueError('Refusing to approve CI that was not created by the sync bot.')
                 # Re-read the current PR immediately before approval; a queued
                 # workflow may have appeared after the head was moved.
-                current = api(f'repos/{repo}/pulls/{number}')
-                if (current.get('state') != 'open' or current.get('head', {}).get('sha') != head
-                        or current.get('head', {}).get('ref') != branch
-                        or current.get('head', {}).get('repo', {}).get('full_name') != repo
-                        or current.get('base', {}).get('ref') != 'develop'
-                        or current.get('user', {}).get('login') != 'github-actions[bot]'):
-                    raise ValueError('Sync PR moved before approval; refusing queued CI approval.')
+                current = read_owned_pull(repo, number, branch, head)
+                if current.get('user', {}).get('login') != 'github-actions[bot]':
+                    raise ValueError('Sync PR author changed before approval; refusing queued CI approval.')
+                remote = api(f'repos/{repo}/git/ref/heads/{branch}')
+                if remote.get('object', {}).get('sha') != head:
+                    raise ValueError('Remote sync head moved before approval; refusing stale run approval.')
                 api(f"repos/{repo}/actions/runs/{run['id']}/approve", '--method', 'POST')
             return run['id']
         time.sleep(5)
