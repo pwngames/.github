@@ -2,6 +2,8 @@ import copy
 import io
 import json
 import subprocess
+import tempfile
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -12,7 +14,7 @@ REPO = 'pwngames/example'
 HEAD, TREE, BLOB, IMPL, BASE = ('a'*40, 'b'*40, 'c'*40, 'd'*40, 'e'*40)
 IDENTITY = {'repository': REPO, 'implementation': IMPL, 'workflow': '.github/workflows/ci.yml',
             'trusted_workflows': ['.github/workflows/ci.yml'], 'profile': 'py314-node20-ubuntu24-arm64-v1',
-            'context': 'isolated-public-validation-v1', 'expected_jobs': ['image', 'test'], 'gate_names': {'.github/workflows/ci.yml': 'ci-gate'},
+            'context': 'isolated-public-validation-v1', 'required_artifacts': [], 'expected_jobs': ['image', 'test'], 'gate_names': {'.github/workflows/ci.yml': 'ci-gate'},
             'checkout_sha': HEAD, 'tree': TREE, 'workflow_blob': BLOB, 'workflow_blobs': {'.github/workflows/ci.yml': BLOB}}
 
 
@@ -22,7 +24,7 @@ def receipt():
 
 def run():
     return {'id': 7, 'run_attempt': 1, 'repository': {'full_name': REPO, 'id': 11}, 'head_repository': {'full_name': REPO, 'id': 11},
-            'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'success', 'event': 'push', 'head_sha': HEAD}
+            'head_branch': 'main', 'path': '.github/workflows/ci.yml', 'status': 'completed', 'conclusion': 'success', 'event': 'push', 'head_sha': HEAD}
 
 
 def artifact():
@@ -45,17 +47,20 @@ class FakeAPI:
         self.commit = {'sha': HEAD, 'tree': {'sha': TREE}, 'parents': [{'sha': BASE}]}
         self.blob = BLOB
         self.jobs = {'total_count': 1, 'jobs': [{'name': 'ci-gate', 'conclusion': 'success', 'check_run_url': f'https://api.github.com/repos/{REPO}/check-runs/9'}]}
+        self.files = [{"filename": "docs/guide.md", "status": "modified"}]
+        self.extra_artifacts = []
         self.check = {'app': {'id': 15368}, 'conclusion': 'success', 'head_sha': HEAD}
 
     def get(self, endpoint, raw=False):
         if '/commits/' in endpoint and '/pulls?' in endpoint: return [{'number': 12}]
         if endpoint.endswith('/pulls/12'): return {'number': 12, 'head': {'sha': BASE, 'repo': {'full_name': REPO}}, 'base': {'repo': {'full_name': REPO}}}
+        if '/compare/' in endpoint: return {'merge_base_commit': {'sha': BASE}, 'total_commits': 1, 'files': self.files}
         if '/git/commits/' in endpoint: return self.commit
         if '/contents/' in endpoint: return {'sha': self.blob}
         if endpoint.endswith('/jobs?per_page=100'): return self.jobs
         if '/check-runs/' in endpoint: return self.check
-        if endpoint.endswith('/zip'): return zipped(self.receipt)
-        if endpoint.endswith('/artifacts?per_page=100'): return {'total_count': 1, 'artifacts': [self.artifact]}
+        if endpoint.endswith('/zip'): return zipped(self.receipt, 'ci-verdict.json' if self.artifact['name'].startswith('ci-verdict-') else 'ci-qualification.json')
+        if endpoint.endswith('/artifacts?per_page=100'): return {'total_count': 1 + len(self.extra_artifacts), 'artifacts': [self.artifact] + self.extra_artifacts}
         if endpoint.endswith('/runs?status=success&per_page=10'): return {'workflow_runs': [self.run]}
         if endpoint.endswith('/actions/runs/7'): return self.run
         if endpoint.endswith('/actions/artifacts/8'): return self.artifact
@@ -98,6 +103,103 @@ class QualificationTests(unittest.TestCase):
             return HEAD if args[1] == 'HEAD' else TREE if args[1] == 'HEAD^{tree}' else BLOB
         with patch.object(q, 'git', side_effect=clean_git):
             self.assertEqual(q.local_identity(IDENTITY, {'GITHUB_SHA': HEAD})['tree'], TREE)
+
+    def docs_verdict(self):
+        self.api.artifact['name'] = 'ci-verdict-attempt-1'
+        self.api.receipt.update(mode='docs', results={'image': 'skipped', 'test': 'skipped'}, paths=['docs/guide.md'], source_base=BASE)
+        return q.verify_proof(self.api, IDENTITY, self.api.run, self.api.artifact, self.api.receipt, kind='verdict')
+
+    def test_docs_source_verdict_is_not_full_qualification(self):
+        self.assertEqual(self.docs_verdict()['run_id'], 7)
+        with self.assertRaises(ValueError): self.verify()
+
+    def test_docs_verdict_rejects_actual_runtime_or_rename_changes(self):
+        for files in [[{'filename': 'src/app.py', 'status': 'modified'}], [{'filename': 'docs/guide.md', 'previous_filename': 'src/app.py', 'status': 'renamed'}]]:
+            self.api.files = files
+            with self.assertRaises(ValueError): self.docs_verdict()
+
+    def test_docs_verdict_cannot_use_unrelated_base(self):
+        with patch.object(self.api, 'get', side_effect=lambda endpoint, **kwargs: {'merge_base_commit': {'sha': IMPL}, 'total_commits': 1, 'files': self.api.files} if '/compare/' in endpoint else FakeAPI.get(self.api, endpoint, **kwargs)):
+            with self.assertRaises(ValueError): self.docs_verdict()
+
+    def test_docs_verdict_rejects_truncated_source_diff(self):
+        self.api.files = [{'filename': 'docs/guide.md'}] * 300
+        with self.assertRaises(ValueError): self.docs_verdict()
+
+    def test_required_build_outputs_missing_or_expired_force_full(self):
+        identity = {**IDENTITY, 'required_artifacts': ['site-out']}
+        self.api.receipt.update(required_artifacts=['site-out'])
+        self.assertEqual(q.plan(self.api, identity, ['src/x'])['mode'], 'full')
+        output = copy.deepcopy(self.api.artifact); output.update(id=10, name='site-out')
+        self.api.extra_artifacts = [output]
+        self.assertEqual(q.plan(self.api, identity, ['src/x'])['mode'], 'reuse')
+        output['expired'] = True
+        self.assertEqual(q.plan(self.api, identity, ['src/x'])['mode'], 'full')
+
+    def test_record_cli_emits_verdict_all_modes_but_qualification_only_full(self):
+        for mode in ('full', 'docs', 'reuse'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+                root = Path(directory); event = root/'event.json'; event.write_text(json.dumps({'before': BASE}))
+                selected = q.plan(self.api, IDENTITY, ['docs/guide.md'] if mode == 'docs' else ['src/x'])
+                selected['mode'] = mode
+                statuses = {'plan': {'result': 'success'}, 'image': {'result': 'success' if mode == 'full' else 'skipped'}, 'test': {'result': 'success' if mode == 'full' else 'skipped'}}
+                env = {'CI_PLAN': json.dumps(selected), 'CI_RESULTS': json.dumps(statuses), 'GITHUB_RUN_ID': '99', 'GITHUB_RUN_ATTEMPT': '1', 'RUNNER_TEMP': directory, 'GITHUB_OUTPUT': str(root/'outputs'), 'GITHUB_EVENT_NAME': 'push', 'GITHUB_EVENT_PATH': str(event), 'CI_RECORD_RUNTIME_NOOP': 'true', 'GITHUB_REF_NAME': 'main', 'RUNNER_TEMP': directory, 'GITHUB_RUN_ID': '99'}
+                with patch.dict(q.os.environ, env), patch.object(q, 'inputs', return_value=IDENTITY), patch.object(q, 'local_identity', return_value=IDENTITY), patch.object(q, 'changed_paths', return_value=['docs/guide.md'] if mode == 'docs' else ['src/x']), patch.object(q, 'GitHub', return_value=self.api), patch.object(q.sys, 'argv', ['ci_qualification.py', 'record']):
+                    q.main()
+                self.assertTrue((root/'ci-verdict.json').is_file())
+                self.assertEqual((root/'ci-qualification.json').is_file(), mode == 'full')
+                self.assertEqual((root/'production-sync-receipt.json').is_file(), mode == 'docs')
+                if mode == 'docs':
+                    noop = json.loads((root/'production-sync-receipt.json').read_text())
+                    self.assertEqual(noop['outcome'], 'no_runtime_change')
+                    self.assertEqual(noop['sha'], HEAD)
+                verdict = json.loads((root/'ci-verdict.json').read_text())
+                self.assertEqual(verdict['mode'], mode)
+                self.assertEqual(verdict['source_base'], BASE)
+
+    def test_downstream_verdict_cli_returns_no_runtime_only_for_verified_docs(self):
+        self.docs_verdict()
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            output = Path(directory)/'outputs'
+            env = {'CI_SOURCE_RUN': '7', 'CI_SOURCE_SHA': HEAD, 'GITHUB_OUTPUT': str(output), 'GITHUB_EVENT_NAME': 'workflow_dispatch'}
+            with patch.dict(q.os.environ, env), patch.object(q, 'inputs', return_value=IDENTITY), patch.object(q, 'local_identity', return_value=IDENTITY), patch.object(q, 'changed_paths', return_value=None), patch.object(q, 'GitHub', return_value=self.api), patch.object(q.sys, 'argv', ['ci_qualification.py', 'verdict']):
+                q.main()
+            self.assertIn('mode=docs', output.read_text())
+            self.assertIn('outcome=no_runtime_change', output.read_text())
+            self.api.run['head_sha'] = BASE
+            with patch.dict(q.os.environ, env), patch.object(q, 'inputs', return_value=IDENTITY), patch.object(q, 'local_identity', return_value=IDENTITY), patch.object(q, 'changed_paths', return_value=None), patch.object(q, 'GitHub', return_value=self.api), patch.object(q.sys, 'argv', ['ci_qualification.py', 'verdict']):
+                with self.assertRaises(ValueError): q.main()
+
+    def test_workflow_run_verdict_is_bound_to_exact_trigger(self):
+        self.docs_verdict()
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            root = Path(directory); event = root/'event.json'; output = root/'outputs'
+            trigger = {'workflow_run': {'id': 7, 'head_sha': HEAD, 'head_repository': {'full_name': REPO}}}
+            event.write_text(json.dumps(trigger))
+            env = {'CI_SOURCE_RUN': '7', 'CI_SOURCE_SHA': HEAD, 'GITHUB_OUTPUT': str(output), 'GITHUB_EVENT_NAME': 'workflow_run', 'GITHUB_EVENT_PATH': str(event), 'CI_RECORD_RUNTIME_NOOP': 'true', 'GITHUB_REF_NAME': 'main', 'RUNNER_TEMP': directory, 'GITHUB_RUN_ID': '99'}
+            def invoke():
+                with patch.dict(q.os.environ, env), patch.object(q, 'inputs', return_value=IDENTITY), patch.object(q, 'local_identity', return_value=IDENTITY), patch.object(q, 'changed_paths', return_value=None), patch.object(q, 'GitHub', return_value=self.api), patch.object(q.sys, 'argv', ['ci_qualification.py', 'verdict']):
+                    q.main()
+            invoke()
+            trigger['workflow_run']['id'] = 99; event.write_text(json.dumps(trigger))
+            with self.assertRaises(ValueError): invoke()
+            trigger['workflow_run']['id'] = 7
+            trigger['workflow_run']['head_repository']['full_name'] = 'foreign/repo'; event.write_text(json.dumps(trigger))
+            with self.assertRaises(ValueError): invoke()
+
+    def test_runtime_noop_receipts_distinguish_environment_and_never_claim_deployed(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            env = {'GITHUB_RUN_ID': '99', 'RUNNER_TEMP': directory}
+            for branch in ('main', 'develop'):
+                outputs = q.write_runtime_noop(IDENTITY, 7, 1, branch, env)
+                payload = json.loads(Path(outputs['noop_file']).read_text())
+                self.assertEqual(payload['run_id'], '99')
+                self.assertEqual(payload['source_ci_run'], '7')
+                self.assertEqual(payload['environment'], 'production' if branch == 'main' else 'development')
+                self.assertEqual(payload['outcome'], 'no_runtime_change')
+                self.assertNotIn('deployed', payload)
+            with self.assertRaises(ValueError): q.write_runtime_noop(IDENTITY, 7, 1, 'feature', env)
+            with self.assertRaises(ValueError): q.write_runtime_noop(IDENTITY, True, 1, 'main', env)
 
     def test_full_successful_exact_tree_can_be_reused(self):
         self.assertEqual(q.plan(self.api, IDENTITY, ['src/app.py'])['mode'], 'reuse')

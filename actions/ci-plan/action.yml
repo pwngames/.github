@@ -10,6 +10,9 @@ inputs:
   expected-jobs:
     description: JSON array of every heavy job id required by this profile (excluding plan).
     required: true
+  required-artifacts:
+    description: JSON artifact names that must remain available for exact-tree build reuse.
+    default: '[]'
   workflow-path:
     description: Validation policy workflow path.
     default: .github/workflows/ci.yml
@@ -26,6 +29,15 @@ inputs:
     description: Same immutable 40-character commit as the action uses reference.
     required: true
 outputs:
+  qualified-run:
+    description: Verified producer run, or this run when full validation is required.
+    value: ${{ steps.plan.outputs.qualified-run }}
+  qualified-attempt:
+    description: Verified full producer attempt.
+    value: ${{ steps.plan.outputs.qualified-attempt }}
+  qualified-checkout:
+    description: Actual producer checkout, bound to the identical qualified tree.
+    value: ${{ steps.plan.outputs.qualified-checkout }}
   mode:
     description: full, docs or reuse.
     value: ${{ steps.plan.outputs.mode }}
@@ -45,6 +57,7 @@ runs:
       shell: bash
       env:
         CI_ACTION_REF: ${{ github.action_ref }}
+        CI_REQUIRED_ARTIFACTS: ${{ inputs.required-artifacts }}
         CI_PROFILE: ${{ inputs.profile }}
         CI_VALIDATION_CONTEXT: ${{ inputs.validation-context }}
         CI_EXPECTED_JOBS: ${{ inputs.expected-jobs }}
