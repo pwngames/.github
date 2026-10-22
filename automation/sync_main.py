@@ -123,21 +123,45 @@ def sync_branch(repo, main_sha):
     return branch, git(repo, 'rev-parse', 'HEAD')
 
 
+def wait_for_dispatched_ci(repo, branch, head, *, timeout=2100):
+    """Only a successful real CI dispatch on the exact owned head qualifies.
+
+    PR-event runs created by GITHUB_TOKEN may need human approval. Explicit
+    dispatch runs avoid that recursion guard without approving unknown runs.
+    """
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        runs = api(f'repos/{repo}/actions/workflows/ci.yml/runs?branch={branch}&event=workflow_dispatch&head_sha={head}&per_page=20')['workflow_runs']
+        candidates = [run for run in runs if run.get('head_sha') == head and run.get('head_branch') == branch
+                      and run.get('event') == 'workflow_dispatch' and run.get('path') == '.github/workflows/ci.yml']
+        if candidates:
+            run = candidates[0]
+            if run['status'] == 'completed':
+                if run.get('conclusion') != 'success':
+                    raise ValueError('Dispatched synchronization CI did not succeed; no auto-merge enabled.')
+                jobs = api(f"repos/{repo}/actions/runs/{run['id']}/jobs?per_page=100")['jobs']
+                if not any(job.get('name') in ('ci-gate', 'verify') and job.get('conclusion') == 'success' for job in jobs):
+                    raise ValueError('Dispatched CI has no successful trusted gate; no auto-merge enabled.')
+                return run['id']
+        time.sleep(15)
+    raise ValueError('Timed out waiting for exact-head synchronization CI; no auto-merge enabled.')
+
+
 def protected_auto_merge(repo, number, head):
     settings = api(f'repos/{repo}')
     if not settings.get('allow_auto_merge') or not settings.get('allow_merge_commit'):
         print('::notice::Sync PR requires manual merge: protected merge-commit auto-merge is not enabled.')
         return False
-    # Fail closed for missing/inaccessible protection or ruleset-only policies.
-    try:
-        protection = api(f'repos/{repo}/branches/develop/protection')
-    except subprocess.CalledProcessError:
-        print('::notice::Sync PR requires manual merge: branch protection could not be verified.')
+    # Branch metadata is readable with contents:read. The administration-only
+    # protection endpoint is deliberately unavailable to GITHUB_TOKEN.
+    branch = api(f'repos/{repo}/branches/develop')
+    if not branch.get('protected'):
+        print('::notice::Sync PR requires manual merge: develop is not protected.')
         return False
-    checks = protection.get('required_status_checks') or {}
-    if not (checks.get('contexts') or checks.get('checks')) or protection.get('required_linear_history', {}).get('enabled'):
-        print('::notice::Sync PR requires manual merge: verified required checks and merge history are necessary.')
-        return False
+    pull = api(f'repos/{repo}/pulls/{number}')
+    if pull.get('head', {}).get('sha') != head or pull.get('base', {}).get('ref') != 'develop':
+        raise ValueError('Sync PR changed after validation; refusing auto-merge.')
     command('gh', 'pr', 'merge', str(number), '--repo', repo, '--auto', '--merge', '--match-head-commit', head)
     return True
 
@@ -195,6 +219,10 @@ def run(args):
     command('gh', 'workflow', 'run', 'ci.yml', '--repo', repo, '--ref', branch)
     current = api(f'repos/{repo}/git/ref/heads/main')['object']['sha']
     if current == sha and args.auto_merge:
+        wait_for_dispatched_ci(repo, branch, head)
+        if api(f'repos/{repo}/git/ref/heads/main')['object']['sha'] != sha:
+            print('Newer main superseded this validated sync PR; no auto-merge enabled.')
+            return
         protected_auto_merge(repo, number, head)
     print(f'https://github.com/{repo}/pull/{number}')
 
