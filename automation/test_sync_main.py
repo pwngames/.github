@@ -42,7 +42,7 @@ class PolicyTests(unittest.TestCase):
 
     def test_duplicate_pr_reused_and_ci_explicitly_triggered(self):
         args=argparse.Namespace(find_production_run=False,run_id='',sha='a'*40,repository='unused',auto_merge=False)
-        with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=[{'ref':'refs/heads/develop'},[{'number':17}],{'object':{'sha':'a'*40}}]) as api,patch.object(sync,'sync_branch',return_value=('sync/main-to-develop-aaaaaaaaaaaa','b'*40)),patch.object(sync,'command') as command:
+        with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=[{'ref':'refs/heads/develop'},[{'number':17}],{'object':{'sha':'a'*40}}]) as api,patch.object(sync,'sync_branch',return_value=('sync/main-to-develop-aaaaaaaaaaaa','b'*40)),patch.object(sync,'command') as command,patch.object(sync,'prepare_owned_pr_ci',return_value=None):
             sync.run(args)
             self.assertEqual(api.call_count,3)
             command.assert_called_once_with('gh','workflow','run','ci.yml','--repo','pwngames/app','--ref','sync/main-to-develop-aaaaaaaaaaaa')
@@ -140,3 +140,55 @@ class DispatchProofTests(unittest.TestCase):
         with patch.object(sync,'api',side_effect=[{'allow_auto_merge':True,'allow_merge_commit':True},{'protected':True},{'head':{'sha':'b'*40},'base':{'ref':'develop'}}]),patch.object(sync,'command') as command,self.assertRaises(ValueError):
             sync.protected_auto_merge('pwngames/app',1,'a'*40)
         command.assert_not_called()
+
+
+class OwnedApprovalTests(unittest.TestCase):
+    repo='pwngames/app'
+    branch='sync/main-to-develop-aaaaaaaaaaaa'
+    head='a'*40
+
+    def fixtures(self):
+        pull=dict(state='open',user={'login':'github-actions[bot]'},head={'sha':self.head,'ref':self.branch,'repo':{'full_name':self.repo}},base={'ref':'develop'})
+        run=dict(id=22,head_sha=self.head,head_branch=self.branch,path='.github/workflows/ci.yml',event='pull_request',head_repository={'full_name':self.repo},conclusion='action_required',actor={'login':'github-actions[bot]'},pull_requests=[{'number':7,'head':{'sha':self.head,'ref':self.branch},'base':{'ref':'develop'}}])
+        return pull,run
+
+    def test_only_exact_owned_bot_run_is_approved(self):
+        pull,run=self.fixtures()
+        with patch.object(sync,'api',side_effect=[pull,{'workflow_runs':[run]},pull,{}]) as api:
+            self.assertEqual(sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head),22)
+            self.assertEqual(api.call_args.args,(f'repos/{self.repo}/actions/runs/22/approve','--method','POST'))
+
+    def test_other_actor_or_pr_author_cannot_be_approved(self):
+        for actor in ['run','pull']:
+            pull,run=self.fixtures()
+            (run if actor=='run' else pull)['actor' if actor=='run' else 'user']={'login':'someone-else'}
+            with patch.object(sync,'api',side_effect=[pull,{'workflow_runs':[run]}]) as api,self.assertRaises(ValueError):
+                sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head)
+            self.assertEqual(api.call_count,2)
+
+    def test_moved_or_foreign_pr_never_queries_or_approves_runs(self):
+        for key,value in [('sha','b'*40),('ref','foreign'),('repo',{'full_name':'fork/app'})]:
+            pull,run=self.fixtures();pull['head'][key]=value
+            with patch.object(sync,'api',return_value=pull) as api,self.assertRaises(ValueError):
+                sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head)
+            api.assert_called_once()
+
+    def test_foreign_workflow_head_or_missing_pr_link_is_never_approved(self):
+        for change in [{'path':'.github/workflows/untrusted.yml'},{'head_sha':'b'*40},{'head_repository':{'full_name':'fork/app'}},{'pull_requests':[]}]:
+            pull,run=self.fixtures();run.update(change)
+            with patch.object(sync,'api',side_effect=[pull,{'workflow_runs':[run]}]) as api,patch('time.monotonic',side_effect=[0,0,2]),patch('time.sleep'):
+                self.assertIsNone(sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head,timeout=1))
+            self.assertEqual(api.call_count,2)
+
+    def test_existing_normal_pr_ci_is_reused_without_approval_or_extra_dispatch(self):
+        pull,run=self.fixtures();run['conclusion']=None;run['status']='in_progress'
+        with patch.object(sync,'api',side_effect=[pull,{'workflow_runs':[run]}]) as api:
+            self.assertEqual(sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head),22)
+            self.assertEqual(api.call_count,2)
+
+
+    def test_head_moved_immediately_before_approval_is_rejected(self):
+        pull,run=self.fixtures();moved={**pull,'head':{**pull['head'],'sha':'b'*40}}
+        with patch.object(sync,'api',side_effect=[pull,{'workflow_runs':[run]},moved]) as api,self.assertRaises(ValueError):
+            sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head)
+        self.assertEqual(api.call_count,3)
