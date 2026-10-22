@@ -30,10 +30,45 @@ def git(*args):
     return subprocess.check_output(["git", *args], text=True).strip()
 
 
+class GitHubError(subprocess.SubprocessError):
+    """Only a fixed endpoint-stage/status code may reach a CI diagnostic."""
+    def __init__(self, code):
+        self.code = code
+        super().__init__(code)
+
+
+def api_stage(endpoint):
+    if "/check-runs/" in endpoint:
+        return "checks_read"
+    if "/pulls" in endpoint:
+        return "pull_requests_read"
+    if "/git/commits/" in endpoint or "/contents/" in endpoint or "/compare/" in endpoint:
+        return "contents_read"
+    if endpoint.endswith("/zip"):
+        return "artifact_download"
+    if "/artifacts" in endpoint:
+        return "artifacts_read"
+    if "/jobs" in endpoint:
+        return "jobs_read"
+    return "workflow_runs_read"
+
+
 class GitHub:
     def get(self, endpoint, raw=False):
-        output = subprocess.check_output(["gh", "api", endpoint], stderr=subprocess.DEVNULL, timeout=30)
-        return output if raw else json.loads(output)
+        stage = api_stage(endpoint)
+        try:
+            response = subprocess.run(["gh", "api", endpoint], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        except subprocess.TimeoutExpired:
+            raise GitHubError(f"{stage}_timeout") from None
+        if response.returncode:
+            # Never emit raw gh diagnostics, response bodies, signed URLs or tokens.
+            match = re.search(rb"HTTP ([1-5][0-9]{2})", response.stderr)
+            status = match[1].decode("ascii") if match else "unavailable"
+            raise GitHubError(f"{stage}_http_{status}")
+        try:
+            return response.stdout if raw else json.loads(response.stdout)
+        except (ValueError, UnicodeError):
+            raise GitHubError(f"{stage}_invalid_json") from None
 
 
 def inputs(env=os.environ):
@@ -233,7 +268,7 @@ def verify_docs_source(api, repo, receipt):
         raise ValueError("Docs verdict does not match actual source paths")
 
 
-def find_qualification(api, identity):
+def find_qualification(api, identity, diagnostics=None):
     repo = identity["repository"]
     runs = []
     for workflow in identity["trusted_workflows"]:
@@ -249,7 +284,10 @@ def find_qualification(api, identity):
                 if artifact.get("name", "").startswith(prefix) and artifact.get("expired") is False and artifact.get("size_in_bytes", MAX_ARTIFACT + 1) <= MAX_ARTIFACT:
                     receipt = read_receipt(api.get(f"repos/{repo}/actions/artifacts/{artifact['id']}/zip", raw=True))
                     return verify_proof(api, identity, run, artifact, receipt)
-        except (ValueError, KeyError, TypeError, subprocess.SubprocessError, zipfile.BadZipFile, AttributeError, OSError, RuntimeError, NotImplementedError):
+        except (ValueError, KeyError, TypeError, subprocess.SubprocessError, zipfile.BadZipFile, AttributeError, OSError, RuntimeError, NotImplementedError) as error:
+            code = error.code if isinstance(error, GitHubError) else "candidate_proof_rejected"
+            if diagnostics is not None and code not in diagnostics and len(diagnostics) < 5:
+                diagnostics.append(code)
             continue
     return None
 
@@ -260,12 +298,15 @@ def plan(api, identity, paths):
         return {**result, "reason": "unknown_change_set"}
     if docs_only(paths) and len(compact(paths).encode()) <= 4096:
         return {**result, "mode": "docs", "reason": "audited_docs_only", "paths": paths}
+    diagnostics = []
     try:
-        proof = find_qualification(api, identity)
+        proof = find_qualification(api, identity, diagnostics)
         if proof:
             return {**result, "mode": "reuse", "reason": "verified_exact_tree", "proof": proof}
-    except (ValueError, KeyError, TypeError, AttributeError, OSError, subprocess.SubprocessError):
-        pass
+    except (ValueError, KeyError, TypeError, AttributeError, OSError, subprocess.SubprocessError) as error:
+        diagnostics.append(error.code if isinstance(error, GitHubError) else "qualification_lookup_unavailable")
+    if diagnostics:
+        result["diagnostics"] = diagnostics[:5]
     if policy_changed(paths):
         result["reason"] = "new_policy_without_full_qualification"
     return result
@@ -340,6 +381,8 @@ def main():
                    "qualified-attempt": str(proof.get("attempt", os.environ["GITHUB_RUN_ATTEMPT"])),
                    "qualified-checkout": proof.get("checkout_sha", identity["checkout_sha"])}
         print(f"CI mode: {selected['mode']} ({selected['reason']})")
+        for code in selected.get("diagnostics", []):
+            print(f"::notice::CI qualification diagnostic: {code}")
     elif args.command == "record":
         selected = json.loads(os.environ["CI_PLAN"])
         results = json.loads(os.environ["CI_RESULTS"])
