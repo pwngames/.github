@@ -201,6 +201,31 @@ class QualificationTests(unittest.TestCase):
             with self.assertRaises(ValueError): q.write_runtime_noop(IDENTITY, 7, 1, 'feature', env)
             with self.assertRaises(ValueError): q.write_runtime_noop(IDENTITY, True, 1, 'main', env)
 
+    def test_api_diagnostics_expose_only_fixed_stage_and_status(self):
+        for endpoint, stage in [('repos/owner/repo/commits/abc/pulls?per_page=100', 'pull_requests_read'), ('repos/owner/repo/check-runs/9', 'checks_read')]:
+            response = subprocess.CompletedProcess(['gh'], 1, stdout=b'private-response-body', stderr=b'private credential and signed URL (HTTP 403)')
+            with patch.object(q.subprocess, 'run', return_value=response):
+                with self.assertRaises(q.GitHubError) as error:
+                    q.GitHub().get(endpoint)
+            self.assertEqual(str(error.exception), f'{stage}_http_403')
+            self.assertNotIn('private', str(error.exception))
+            self.assertNotIn('signed', str(error.exception))
+
+    def test_missing_permission_reason_survives_safe_full_fallback(self):
+        with patch.object(self.api, 'get', side_effect=q.GitHubError('checks_read_http_403')):
+            selected = q.plan(self.api, IDENTITY, ['src/x'])
+        self.assertEqual(selected['mode'], 'full')
+        self.assertEqual(selected['diagnostics'], ['checks_read_http_403'])
+
+    def test_candidate_permission_failure_is_diagnosed_without_raw_exception(self):
+        def request(endpoint, **kwargs):
+            if '/check-runs/' in endpoint: raise q.GitHubError('checks_read_http_403')
+            return FakeAPI.get(self.api, endpoint, **kwargs)
+        with patch.object(self.api, 'get', side_effect=request):
+            selected = q.plan(self.api, IDENTITY, ['src/x'])
+        self.assertEqual(selected['mode'], 'full')
+        self.assertEqual(selected['diagnostics'], ['checks_read_http_403'])
+
     def test_full_successful_exact_tree_can_be_reused(self):
         self.assertEqual(q.plan(self.api, IDENTITY, ['src/app.py'])['mode'], 'reuse')
 
