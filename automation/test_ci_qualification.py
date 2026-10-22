@@ -226,6 +226,21 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(selected['mode'], 'full')
         self.assertEqual(selected['diagnostics'], ['checks_read_http_403'])
 
+    def test_unknown_change_set_can_reuse_only_verified_exact_tree(self):
+        selected = q.plan(self.api, IDENTITY, None)
+        self.assertEqual(selected['mode'], 'reuse')
+        outcomes = {'plan': {'result': 'success'}, 'image': {'result': 'skipped'}, 'test': {'result': 'skipped'}}
+        self.assertIsNone(q.record(self.api, IDENTITY, selected, outcomes, None))
+        self.api.receipt['tree'] = BASE
+        self.assertEqual(q.plan(self.api, IDENTITY, None)['mode'], 'full')
+        with self.assertRaises(ValueError): q.record(self.api, IDENTITY, selected, outcomes, None)
+
+    def test_dispatch_without_receipt_still_runs_full_never_docs(self):
+        self.api.artifact['name'] = 'legacy-coverage'
+        selected = q.plan(self.api, IDENTITY, None)
+        self.assertEqual(selected['mode'], 'full')
+        self.assertEqual(selected['reason'], 'unknown_change_set')
+
     def test_full_successful_exact_tree_can_be_reused(self):
         self.assertEqual(q.plan(self.api, IDENTITY, ['src/app.py'])['mode'], 'reuse')
 

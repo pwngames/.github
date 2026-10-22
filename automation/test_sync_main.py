@@ -180,8 +180,56 @@ class NativeQueueTests(unittest.TestCase):
     def test_inaccessible_gate_rule_fails_closed(self):
         for failure in [subprocess.CalledProcessError(1, ['gh'], stderr='HTTP 403'), {'errors': [{'message': 'forbidden'}]}]:
             with patch.object(sync, 'read_owned_pull', return_value=self.pull()), patch.object(sync, 'api', side_effect=[self.responses()[0], self.responses()[1], failure]), patch.object(sync, 'command') as command:
-                with self.assertRaises((subprocess.CalledProcessError, ValueError)): self.queue()
+                self.assertEqual(self.queue(), 'manual_merge_required')
                 command.assert_not_called()
+
+    def test_public_branch_payload_requires_explicit_everyone_app_bound_gate(self):
+        import copy
+        good={'protected':True,'protection':{'enabled':True,'required_status_checks':{
+            'enforcement_level':'everyone','checks':[{'app_id':15368,'context':'ci-gate'}], 'contexts':['ci-gate']}}}
+        with patch.object(sync,'api') as api:
+            self.assertTrue(sync.has_trusted_required_gate(self.repo, good));api.assert_not_called()
+        mutations=[lambda p:p['protection'].update(enabled=False),
+                   lambda p:p['protection'].pop('enabled'),
+                   lambda p:p['protection']['required_status_checks'].update(enforcement_level='non_admins'),
+                   lambda p:p['protection']['required_status_checks'].pop('checks'),
+                   lambda p:p['protection']['required_status_checks']['checks'][0].pop('app_id'),
+                   lambda p:p['protection']['required_status_checks']['checks'][0].update(app_id=1),
+                   lambda p:p['protection']['required_status_checks']['checks'][0].update(context='foreign')]
+        for mutation in mutations:
+            value=copy.deepcopy(good);mutation(value)
+            with patch.object(sync,'api',return_value={}) as api:
+                self.assertFalse(sync.has_trusted_required_gate(self.repo,value));api.assert_called_once()
+
+    def test_branch_proof_queues_without_graphql_permission(self):
+        branch={'protected':True,'protection':{'enabled':True,'required_status_checks':{
+            'enforcement_level':'everyone','checks':[{'app_id':15368,'context':'verify'}]}}}
+        responses=[self.responses()[0],branch,{'object':{'sha':self.head}},{'object':{'sha':self.main}}]
+        with patch.object(sync,'read_owned_pull',return_value=self.pull()),patch.object(sync,'api',side_effect=responses) as api,patch.object(sync,'command') as command:
+            self.assertEqual(self.queue(),'awaiting_checks');command.assert_called_once()
+            self.assertFalse(any(call.args[0]=='graphql' for call in api.call_args_list))
+
+    def test_denied_protection_diagnostics_are_sanitized(self):
+        import contextlib,io
+        secret='sensitive-provider-error'
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output),patch.object(sync,'api',side_effect=subprocess.CalledProcessError(1,['gh'],stderr=secret)):
+            self.assertFalse(sync.has_trusted_required_gate(self.repo,{'protected':True}))
+        self.assertNotIn(secret,output.getvalue())
+        self.assertIn('manual merge',output.getvalue())
+
+    def test_malformed_nested_protection_metadata_fails_closed(self):
+        rest=[[], {'protection':[]}, {'protection':{'required_status_checks':'invalid'}},
+              {'protection':{'enabled':True,'required_status_checks':{'enforcement_level':'everyone','checks':[None,'invalid']}}}]
+        for value in rest:
+            with patch.object(sync,'api',return_value={}):
+                self.assertFalse(sync.has_trusted_required_gate(self.repo,value))
+        graphql=[{'data':[]},{'data':{'repository':1}},{'data':{'repository':{'ref':'invalid'}}},
+                 {'data':{'repository':{'ref':{'branchProtectionRule':[]}}}},
+                 {'data':{'repository':{'ref':{'branchProtectionRule':{'requiresStatusChecks':True,'requiredStatusChecks':[None,{'app':'invalid'}]}}}}}]
+        for value in graphql:
+            with patch.object(sync,'api',return_value=value):
+                self.assertFalse(sync.has_trusted_required_gate(self.repo))
 
     def test_verify_gate_is_supported(self):
         rule=self.rule(); rule['data']['repository']['ref']['branchProtectionRule']['requiredStatusChecks'][0]['context']='verify'

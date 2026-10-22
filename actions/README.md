@@ -21,7 +21,7 @@ Only full mode uploads `ci-qualification-<tree>-<profile-context-policy-hash>-at
 
 Reuse verifies the own-repository successful CI run, artifact run/head/repository IDs, nonexpired bounded ZIP, exact tree/profile/context/policy, actual Git commit and PR merge parents, and the successful aggregate check from GitHub Actions app15368. Merged PRs can lose their run linkage; the recorded event PR is then corroborated against the exact head-commit association and own-repository PR. Earlier full attempts of a subsequently successful same run are allowed; future/foreign attempts are rejected.
 
-The docs allowlist is only `docs/**` and top-level `README*.md`. Unknown changes, missing history/API/proof, legacy runs without a receipt, unqualified CI/policy/config changes or invalid artifacts select full validation. A new policy requires a first full run; later exact-tree proof with all current workflow blobs and the immutable implementation can qualify that same policy tree across events. A contradictory gate fails closed. The bounded candidate search may miss an older valid receipt, which costs another full run rather than relaxing evidence.
+The docs allowlist is only `docs/**` and top-level `README*.md`. Unknown changes or missing history never permit docs classification. They can still reuse a fully verified identical tree; without that exact proof, missing API/proof, legacy runs, unqualified CI/policy/config changes or invalid artifacts select full validation. A new policy requires a first full run; later exact-tree proof with all current workflow blobs and the immutable implementation can qualify that same policy tree across events. A contradictory gate fails closed. The bounded candidate search may miss an older valid receipt, which costs another full run rather than relaxing evidence.
 
 The actions do not authorize a deployment or cross-environment artifact reuse. Consumers must preserve delivery checks and bind any reused build output to its exact build mode and provenance separately.
 
@@ -41,3 +41,6 @@ Both `ci-record` and `ci-verdict` offer `record-runtime-noop: 'true'`, default f
 
 
 Permission/API lookup failures conservatively select full validation and emit only fixed stage/status codes such as `pull_requests_read_http_403` or `checks_read_http_403`. Raw gh stderr, response bodies, signed URLs and credential data are never included in these diagnostics. Gate revalidation failures still fail closed. GitHub documents [read access for associated pull requests](https://docs.github.com/en/rest/commits/commits#list-pull-requests-associated-with-a-commit) and [checks read for a check run](https://docs.github.com/en/rest/checks/runs#get-a-check-run).
+
+
+Synthetic synchronization CI can be triggered by `workflow_dispatch`, whose event has no before/base diff. That does not prevent exact-tree qualification reuse: the complete checkout tree, policy blobs, profile/context, immutable helper, trusted source gate and full receipt are still independently corroborated. The gate revalidates the same proof and expected skips. A missing or changed proof runs full; unknown diffs never authorize docs-only classification.
