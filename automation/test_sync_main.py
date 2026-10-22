@@ -29,20 +29,9 @@ class PolicyTests(unittest.TestCase):
         with patch.object(sync,'api',side_effect=[run,{'artifacts':[]}]):
             self.assertIsNone(sync.source_sha('pwngames/app','deliver.yml','12',receipt=True))
 
-    def test_no_auto_merge_without_verified_protections(self):
-        for settings,protection in [({'allow_auto_merge':False},{}),({'allow_auto_merge':True,'allow_merge_commit':True},{}),({'allow_auto_merge':True,'allow_merge_commit':True},{'protected':False})]:
-            with patch.object(sync,'api',side_effect=[settings,protection]),patch.object(sync,'command') as command:
-                self.assertFalse(sync.protected_auto_merge('pwngames/app',1,'a'*40))
-                command.assert_not_called()
-
-    def test_auto_merge_matches_head_without_bypass(self):
-        with patch.object(sync,'api',side_effect=[{'allow_auto_merge':True,'allow_merge_commit':True},{'protected':True},{'head':{'sha':'a'*40},'base':{'ref':'develop'}}]),patch.object(sync,'command') as command:
-            self.assertTrue(sync.protected_auto_merge('pwngames/app',1,'a'*40))
-            self.assertEqual(command.call_args.args,('gh','pr','merge','1','--repo','pwngames/app','--auto','--merge','--match-head-commit','a'*40))
-
     def test_duplicate_pr_reused_and_ci_explicitly_triggered(self):
         args=argparse.Namespace(find_production_run=False,run_id='',sha='a'*40,repository='unused',auto_merge=False)
-        with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=[{'ref':'refs/heads/develop'},[{'number':17}],{'object':{'sha':'a'*40}}]) as api,patch.object(sync,'sync_branch',return_value=('sync/main-to-develop-aaaaaaaaaaaa','b'*40)),patch.object(sync,'command') as command,patch.object(sync,'prepare_owned_pr_ci',return_value=None):
+        with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=[{'ref':'refs/heads/develop'},[{'number':17}],{'object':{'sha':'a'*40}}]) as api,patch.object(sync,'sync_branch',return_value=('sync/main-to-develop-aaaaaaaaaaaa','b'*40)),patch.object(sync,'command') as command,patch.object(sync,'prepare_owned_pr_ci',return_value=None),patch.object(sync,'find_dispatched_ci',return_value=sync.PreparedCI(22)),patch.object(sync,'verify_ci_launch'):
             sync.run(args)
             self.assertEqual(api.call_count,3)
             command.assert_called_once_with('gh','workflow','run','ci.yml','--repo','pwngames/app','--ref','sync/main-to-develop-aaaaaaaaaaaa')
@@ -102,13 +91,6 @@ class AdditionalSafetyTests(HistoryTests):
         with self.assertRaisesRegex(ValueError,'outside the history merge'):
             sync.sync_branch(self.work,self.main)
 
-    def test_absent_protection_is_manual_only(self):
-        with patch.object(sync,'api',side_effect=[{'allow_auto_merge':True,'allow_merge_commit':True},subprocess.CalledProcessError(1,['gh'],stderr='HTTP 404')]),patch.object(sync,'command') as command:
-            with self.assertRaises(subprocess.CalledProcessError):
-                sync.protected_auto_merge('pwngames/app',1,'a'*40)
-            command.assert_not_called()
-
-
     def test_develop_advancement_refreshes_same_branch_without_losing_work(self):
         branch, old = sync.sync_branch(self.work,self.main)
         sync.git(self.work,'checkout','develop')
@@ -121,25 +103,194 @@ class AdditionalSafetyTests(HistoryTests):
         self.assertEqual(sync.sync_branch(self.work,self.main),(branch,current))
 
 
-class DispatchProofTests(unittest.TestCase):
-    def run_proof(self, changes=None, jobs=None):
-        run=dict(id=12,head_sha='a'*40,head_branch='sync/main-to-develop-aaaaaaaaaaaa',event='workflow_dispatch',path='.github/workflows/ci.yml',status='completed',conclusion='success')
-        run.update(changes or {})
-        return patch.object(sync,'api',side_effect=[{'workflow_runs':[run]},{'jobs':jobs if jobs is not None else [{'name':'ci-gate','conclusion':'success'}]}])
+class NativeQueueTests(unittest.TestCase):
+    repo = 'pwngames/app'
+    branch = 'sync/main-to-develop-aaaaaaaaaaaa'
+    head = 'a'*40
+    main = 'c'*40
 
-    def test_successful_exact_head_dispatch_qualifies(self):
-        with self.run_proof():
-            self.assertEqual(sync.wait_for_dispatched_ci('pwngames/app','sync/main-to-develop-aaaaaaaaaaaa','a'*40),12)
+    def pull(self, **changes):
+        return dict(state='open', merged=False, head={'sha': self.head, 'ref': self.branch,
+                    'repo': {'full_name': self.repo}}, base={'ref': 'develop'}, **changes)
 
-    def test_failed_dispatch_and_missing_gate_fail_closed(self):
-        for changes,jobs in [({'conclusion':'failure'},None),({},[{'name':'ci-gate','conclusion':'skipped'}])]:
-            with self.run_proof(changes,jobs),self.assertRaises(ValueError):
-                sync.wait_for_dispatched_ci('pwngames/app','sync/main-to-develop-aaaaaaaaaaaa','a'*40)
+    def rule(self, **changes):
+        return {'data': {'repository': {'ref': {'branchProtectionRule': {
+            'requiresStatusChecks': True, 'requiredStatusChecks': [dict(context='ci-gate',
+            app={'databaseId': 15368, 'slug': 'github-actions'}, **changes)]}}}}}
 
-    def test_pr_head_change_prevents_auto_merge(self):
-        with patch.object(sync,'api',side_effect=[{'allow_auto_merge':True,'allow_merge_commit':True},{'protected':True},{'head':{'sha':'b'*40},'base':{'ref':'develop'}}]),patch.object(sync,'command') as command,self.assertRaises(ValueError):
-            sync.protected_auto_merge('pwngames/app',1,'a'*40)
-        command.assert_not_called()
+    def responses(self, rule=None, protected=True):
+        return [{'allow_auto_merge': True, 'allow_merge_commit': True}, {'protected': protected},
+                self.rule() if rule is None else rule, {'object': {'sha': self.head}},
+                {'object': {'sha': self.main}}]
+
+    def queue(self):
+        return sync.protected_auto_merge(self.repo, 7, self.branch, self.head, main_sha=self.main)
+
+    def test_pending_checks_queue_native_auto_merge_without_waiting(self):
+        with patch.object(sync, 'read_owned_pull', return_value=self.pull()), patch.object(sync, 'api', side_effect=self.responses()), patch.object(sync, 'command') as command, patch('time.sleep') as sleep:
+            self.assertEqual(self.queue(), 'awaiting_checks')
+            command.assert_called_once_with('gh', 'pr', 'merge', '7', '--repo', self.repo,
+                    '--auto', '--merge', '--match-head-commit', self.head)
+            sleep.assert_not_called()
+
+    def test_clean_status_uses_only_protected_exact_head_merge(self):
+        failure = subprocess.CalledProcessError(1, ['gh'], stderr='GraphQL: Pull request is in clean status (enablePullRequestAutoMerge)')
+        merged = {**self.pull(), 'state': 'closed', 'merged': True, 'merge_commit_sha': 'f'*40}
+        checks = {'check_runs': [{'head_sha': self.head, 'name': 'ci-gate', 'conclusion': 'success', 'app': {'id': 15368, 'slug': 'github-actions'}}]}
+        responses = self.responses() + [{'object': {'sha': self.head}}, {'object': {'sha': self.main}}, {'protected': True}, self.rule(), checks]
+        with patch.object(sync, 'read_owned_pull', side_effect=[self.pull()]*4+[merged]), patch.object(sync, 'api', side_effect=responses), patch.object(sync, 'command', side_effect=[failure, '']) as command:
+            self.assertEqual(self.queue(), 'merged')
+            self.assertEqual(command.call_count, 2)
+            self.assertNotIn('--auto', command.call_args.args)
+            self.assertIn('--match-head-commit', command.call_args.args)
+
+    def test_other_merge_errors_never_fall_back(self):
+        failure = subprocess.CalledProcessError(1, ['gh'], stderr='HTTP 403 forbidden')
+        with patch.object(sync, 'read_owned_pull', return_value=self.pull()), patch.object(sync, 'api', side_effect=self.responses()), patch.object(sync, 'command', side_effect=failure) as command:
+            with self.assertRaises(subprocess.CalledProcessError): self.queue()
+            self.assertEqual(command.call_count, 1)
+
+    def test_clean_status_without_trusted_green_gate_never_merges(self):
+        for checks in [[], [{'head_sha': self.head, 'name': 'ci-gate', 'conclusion': 'success', 'app': {'id': 1, 'slug': 'foreign'}}]]:
+            failure = subprocess.CalledProcessError(1, ['gh'], stderr='Pull request is in clean status')
+            responses = self.responses()+[{'object': {'sha': self.head}}, {'object': {'sha': self.main}}, {'protected': True}, self.rule(), {'check_runs': checks}]
+            with patch.object(sync, 'read_owned_pull', return_value=self.pull()), patch.object(sync, 'api', side_effect=responses), patch.object(sync, 'command', side_effect=failure) as command:
+                with self.assertRaisesRegex(ValueError, 'successful trusted gate'): self.queue()
+                self.assertEqual(command.call_count, 1)
+
+    def test_no_auto_merge_without_native_settings_or_protected_branch(self):
+        for responses in [[{'allow_auto_merge': False}],
+                          [{'allow_auto_merge': True, 'allow_merge_commit': True}, {'protected': False}]]:
+            with patch.object(sync, 'read_owned_pull', return_value=self.pull()), patch.object(sync, 'api', side_effect=responses), patch.object(sync, 'command') as command:
+                self.assertEqual(self.queue(), 'manual_merge_required')
+                command.assert_not_called()
+
+    def test_missing_disabled_or_wrong_app_gate_never_enables_auto_merge(self):
+        disabled = self.rule(); disabled['data']['repository']['ref']['branchProtectionRule']['requiresStatusChecks'] = False
+        rules = [{}, {'data': {'repository': {'ref': None}}}, disabled]
+        for check in [{'context': 'unrelated', 'app': {'databaseId': 15368, 'slug': 'github-actions'}},
+                      {'context': 'ci-gate', 'app': None},
+                      {'context': 'ci-gate', 'app': {'databaseId': 1, 'slug': 'github-actions'}},
+                      {'context': 'ci-gate', 'app': {'databaseId': 15368, 'slug': 'foreign'}}]:
+            rule = self.rule(); rule['data']['repository']['ref']['branchProtectionRule']['requiredStatusChecks'] = [check]; rules.append(rule)
+        for rule in rules:
+            with self.subTest(rule=rule), patch.object(sync, 'read_owned_pull', return_value=self.pull()), patch.object(sync, 'api', side_effect=self.responses(rule)), patch.object(sync, 'command') as command:
+                self.assertEqual(self.queue(), 'manual_merge_required'); command.assert_not_called()
+
+    def test_inaccessible_gate_rule_fails_closed(self):
+        for failure in [subprocess.CalledProcessError(1, ['gh'], stderr='HTTP 403'), {'errors': [{'message': 'forbidden'}]}]:
+            with patch.object(sync, 'read_owned_pull', return_value=self.pull()), patch.object(sync, 'api', side_effect=[self.responses()[0], self.responses()[1], failure]), patch.object(sync, 'command') as command:
+                with self.assertRaises((subprocess.CalledProcessError, ValueError)): self.queue()
+                command.assert_not_called()
+
+    def test_verify_gate_is_supported(self):
+        rule=self.rule(); rule['data']['repository']['ref']['branchProtectionRule']['requiredStatusChecks'][0]['context']='verify'
+        with patch.object(sync, 'api', return_value=rule): self.assertTrue(sync.has_trusted_required_gate(self.repo))
+
+    def test_pr_binding_or_remote_head_race_cannot_enable_auto_merge(self):
+        with patch.object(sync, 'read_owned_pull', side_effect=[self.pull(), ValueError('binding changed')]), patch.object(sync, 'api', side_effect=self.responses()), patch.object(sync, 'command') as command:
+            with self.assertRaises(ValueError): self.queue()
+            command.assert_not_called()
+        responses=self.responses(); responses[3]={'object': {'sha': 'b'*40}}
+        with patch.object(sync, 'read_owned_pull', return_value=self.pull()), patch.object(sync, 'api', side_effect=responses), patch.object(sync, 'command') as command:
+            with self.assertRaises(ValueError): self.queue()
+            command.assert_not_called()
+
+    def test_newer_main_never_enables_stale_auto_merge(self):
+        responses=self.responses(); responses[4]={'object': {'sha': 'd'*40}}
+        with patch.object(sync, 'read_owned_pull', return_value=self.pull()), patch.object(sync, 'api', side_effect=responses), patch.object(sync, 'command') as command:
+            self.assertEqual(self.queue(), 'superseded'); command.assert_not_called()
+
+    def test_fast_native_merge_is_reported_only_after_actual_confirmation(self):
+        merged={**self.pull(), 'state': 'closed', 'merged': True, 'merge_commit_sha': 'f'*40}
+        with patch.object(sync, 'read_owned_pull', side_effect=[self.pull(), self.pull(), merged]), patch.object(sync, 'api', side_effect=self.responses()), patch.object(sync, 'command'):
+            self.assertEqual(self.queue(), 'merged')
+        with patch.object(sync, 'read_owned_pull', return_value=merged), patch.object(sync, 'command') as command:
+            self.assertEqual(self.queue(), 'merged'); command.assert_not_called()
+
+    def test_native_merge_winning_command_race_is_idempotent(self):
+        merged={**self.pull(), 'state': 'closed', 'merged': True, 'merge_commit_sha': 'f'*40}
+        error=subprocess.CalledProcessError(1, ['gh'])
+        with patch.object(sync, 'read_owned_pull', side_effect=[self.pull(), self.pull(), merged]), patch.object(sync, 'api', side_effect=self.responses()), patch.object(sync, 'command', side_effect=error):
+            self.assertEqual(self.queue(), 'merged')
+        with patch.object(sync, 'read_owned_pull', return_value=self.pull()), patch.object(sync, 'api', side_effect=self.responses()), patch.object(sync, 'command', side_effect=error):
+            with self.assertRaises(subprocess.CalledProcessError): self.queue()
+
+
+class LaunchProofTests(unittest.TestCase):
+    repo='pwngames/app'; branch='sync/main-to-develop-aaaaaaaaaaaa'; head='a'*40
+
+    def run_fixture(self, **changes):
+        result=dict(id=22,head_sha=self.head,head_branch=self.branch,event='pull_request',path='.github/workflows/ci.yml',status='queued',conclusion=None,head_repository={'full_name':self.repo},pull_requests=[{'number':7,'head':{'sha':self.head,'ref':self.branch},'base':{'ref':'develop'}}]);result.update(changes);return result
+
+    def test_queued_ci_is_accepted_without_completion_poll(self):
+        with patch.object(sync,'api',return_value=self.run_fixture()) as api,patch('time.sleep') as sleep:
+            sync.verify_ci_launch(self.repo,7,self.branch,self.head,sync.PreparedCI(22))
+            api.assert_called_once();sleep.assert_not_called()
+
+    def test_foreign_missing_or_wrong_ci_cannot_qualify(self):
+        for change in [{'id':23},{'head_sha':'b'*40},{'head_branch':'foreign'},{'path':'.github/workflows/foreign.yml'},{'event':'push'},{'head_repository':{'full_name':'fork/app'}},{'pull_requests':[]}]:
+            with self.subTest(change=change),patch.object(sync,'api',return_value=self.run_fixture(**change)),self.assertRaises(ValueError):
+                sync.verify_ci_launch(self.repo,7,self.branch,self.head,sync.PreparedCI(22))
+
+    def test_completed_failure_or_missing_real_gate_cannot_qualify(self):
+        for conclusion in ['failure','cancelled','timed_out','skipped','neutral']:
+            with patch.object(sync,'api',return_value=self.run_fixture(status='completed',conclusion=conclusion)),self.assertRaises(ValueError):
+                sync.verify_ci_launch(self.repo,7,self.branch,self.head,sync.PreparedCI(22))
+        for jobs in [[],[{'name':'ci-gate','conclusion':'skipped'}],[{'name':'unrelated','conclusion':'success'}]]:
+            with patch.object(sync,'api',side_effect=[self.run_fixture(status='completed',conclusion='success'),{'jobs':jobs}]),self.assertRaises(ValueError):
+                sync.verify_ci_launch(self.repo,7,self.branch,self.head,sync.PreparedCI(22))
+        with patch.object(sync,'api',side_effect=[self.run_fixture(status='completed',conclusion='success'),{'jobs':[{'name':'verify','conclusion':'success'}]}]):
+            sync.verify_ci_launch(self.repo,7,self.branch,self.head,sync.PreparedCI(22))
+
+    def test_dispatch_registration_accepts_pending_but_never_foreign_run(self):
+        run=self.run_fixture(event='workflow_dispatch')
+        with patch.object(sync,'api',return_value={'workflow_runs':[run]}),patch('time.sleep') as sleep:
+            self.assertEqual(sync.find_dispatched_ci(self.repo,self.branch,self.head),sync.PreparedCI(22));sleep.assert_not_called()
+        for change in [{'head_sha':'b'*40},{'path':'foreign'},{'head_repository':{'full_name':'fork/app'}}]:
+            with patch.object(sync,'api',return_value={'workflow_runs':[{**run,**change}]}),patch('time.monotonic',side_effect=[0,0,2]),patch('time.sleep'),self.assertRaises(ValueError):
+                sync.find_dispatched_ci(self.repo,self.branch,self.head,timeout=1)
+
+
+class OutcomeTests(unittest.TestCase):
+    def args(self):
+        return argparse.Namespace(find_production_run=False,run_id='',sha='a'*40,repository='unused',auto_merge=True)
+
+    def test_run_queues_and_returns_truthful_state_without_completion_poll(self):
+        with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=[{},[{'number':7}],{'object':{'sha':'a'*40}}]),patch.object(sync,'sync_branch',return_value=('sync/main-to-develop-aaaaaaaaaaaa','b'*40)),patch.object(sync,'prepare_owned_pr_ci',return_value=sync.PreparedCI(22)),patch.object(sync,'verify_ci_launch') as proof,patch.object(sync,'protected_auto_merge',return_value='awaiting_checks') as native,patch('time.sleep') as sleep:
+            result=sync.run(self.args())
+            self.assertEqual(result,{'state':'awaiting_checks','pull_request_url':'https://github.com/pwngames/app/pull/7','head_sha':'b'*40,'ci_run_id':22})
+            proof.assert_called_once_with('pwngames/app',7,'sync/main-to-develop-aaaaaaaaaaaa','b'*40,sync.PreparedCI(22))
+            native.assert_called_once_with('pwngames/app',7,'sync/main-to-develop-aaaaaaaaaaaa','b'*40,main_sha='a'*40)
+            sleep.assert_not_called()
+
+    def test_new_main_after_ci_launch_is_superseded_without_auto_merge(self):
+        with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=[{},[{'number':7}],{'object':{'sha':'c'*40}}]),patch.object(sync,'sync_branch',return_value=('sync/main-to-develop-aaaaaaaaaaaa','b'*40)),patch.object(sync,'prepare_owned_pr_ci',return_value=sync.PreparedCI(22)),patch.object(sync,'verify_ci_launch'),patch.object(sync,'protected_auto_merge') as native:
+            self.assertEqual(sync.run(self.args())['state'],'superseded');native.assert_not_called()
+
+    def test_native_merge_winning_during_ci_preparation_is_reported_idempotently(self):
+        pull={'state':'closed','merged':True,'merge_commit_sha':'f'*40}
+        with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=[{},[{'number':7}]]),patch.object(sync,'sync_branch',return_value=('sync/main-to-develop-aaaaaaaaaaaa','b'*40)),patch.object(sync,'prepare_owned_pr_ci',side_effect=ValueError('already closed')),patch.object(sync,'read_owned_pull',return_value=pull),patch.object(sync,'command') as command:
+            self.assertEqual(sync.run(self.args())['state'],'merged');command.assert_not_called()
+
+    def test_invalid_closed_pr_cannot_be_reported_as_merged(self):
+        for pull in [{'state':'closed','merged':False},{'state':'closed','merged':True,'merge_commit_sha':'invalid'}]:
+            with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=[{},[{'number':7}]]),patch.object(sync,'sync_branch',return_value=('sync/main-to-develop-aaaaaaaaaaaa','b'*40)),patch.object(sync,'prepare_owned_pr_ci',side_effect=ValueError('closed')),patch.object(sync,'read_owned_pull',return_value=pull),self.assertRaises(ValueError):
+                sync.run(self.args())
+
+    def test_structured_output_never_promises_pending_merge(self):
+        scratch=Path(__file__).resolve().parents[1]/'temp';scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as folder,patch.dict(os.environ,{'GITHUB_OUTPUT':str(Path(folder)/'outputs')}):
+            result=sync.emit_state('awaiting_checks',ci_run_id=22)
+            self.assertEqual(result['state'],'awaiting_checks')
+            self.assertEqual((Path(folder)/'outputs').read_text(),'state=awaiting_checks\nci_run_id=22\n')
+
+    def test_unapproved_action_required_metadata_cannot_qualify(self):
+        case=LaunchProofTests();run=case.run_fixture(status='completed',conclusion='action_required')
+        with patch.object(sync,'api',return_value=run),self.assertRaises(ValueError):
+            sync.verify_ci_launch(case.repo,7,case.branch,case.head,sync.PreparedCI(22))
+        with patch.object(sync,'api',return_value=run):
+            sync.verify_ci_launch(case.repo,7,case.branch,case.head,sync.PreparedCI(22,True))
 
 
 class OwnedApprovalTests(unittest.TestCase):
@@ -155,7 +306,7 @@ class OwnedApprovalTests(unittest.TestCase):
     def test_only_exact_owned_bot_run_is_approved(self):
         pull,run=self.fixtures()
         with patch.object(sync,'api',side_effect=[pull,{'workflow_runs':[run]},pull,{'object':{'sha':self.head}},{}]) as api:
-            self.assertEqual(sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head),22)
+            self.assertEqual(sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head),sync.PreparedCI(22,True))
             self.assertEqual(api.call_args.args,(f'repos/{self.repo}/actions/runs/22/approve','--method','POST'))
 
     def test_other_actor_or_pr_author_cannot_be_approved(self):
@@ -183,7 +334,7 @@ class OwnedApprovalTests(unittest.TestCase):
     def test_existing_normal_pr_ci_is_reused_without_approval_or_extra_dispatch(self):
         pull,run=self.fixtures();run['conclusion']=None;run['status']='in_progress'
         with patch.object(sync,'api',side_effect=[pull,{'workflow_runs':[run]}]) as api:
-            self.assertEqual(sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head),22)
+            self.assertEqual(sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head),sync.PreparedCI(22))
             self.assertEqual(api.call_count,2)
 
 
@@ -228,3 +379,14 @@ class HeadConvergenceTests(unittest.TestCase):
         with patch.object(sync,'api',return_value=stale) as api,patch('time.sleep') as sleep,self.assertRaises(ValueError):
             sync.read_owned_pull('pwngames/app',7,'sync/main-to-develop-aaaaaaaaaaaa','a'*40)
         api.assert_called_once();sleep.assert_not_called()
+
+
+class MergedBindingTests(unittest.TestCase):
+    def test_only_exact_owned_merged_pr_is_idempotent(self):
+        pull={'state':'closed','merged':True,'merge_commit_sha':'f'*40,'head':{'sha':'a'*40,'ref':'sync/main-to-develop-aaaaaaaaaaaa','repo':{'full_name':'pwngames/app'}},'base':{'ref':'develop'}}
+        with patch.object(sync,'api',return_value=pull):
+            self.assertEqual(sync.read_owned_pull('pwngames/app',7,'sync/main-to-develop-aaaaaaaaaaaa','a'*40,allow_merged=True),pull)
+        for change in [{'merged':False},{'head':{**pull['head'],'sha':'b'*40}},{'base':{'ref':'main'}},{'head':{**pull['head'],'repo':{'full_name':'fork/app'}}}]:
+            with self.subTest(change=change),patch.object(sync,'api',return_value={**pull,**change}) as api,self.assertRaises(ValueError):
+                sync.read_owned_pull('pwngames/app',7,'sync/main-to-develop-aaaaaaaaaaaa','a'*40,allow_merged=True)
+            api.assert_called_once()
