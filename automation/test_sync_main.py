@@ -42,14 +42,14 @@ class PolicyTests(unittest.TestCase):
 
     def test_duplicate_pr_reused_and_ci_explicitly_triggered(self):
         args=argparse.Namespace(run_id='',sha='a'*40,repository='unused',auto_merge=False)
-        with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=[[{'name':'develop'}],[{'number':17}],{'object':{'sha':'a'*40}}]) as api,patch.object(sync,'sync_branch',return_value=('sync/main-to-develop-aaaaaaaaaaaa','b'*40)),patch.object(sync,'command') as command:
+        with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=[{'ref':'refs/heads/develop'},[{'number':17}],{'object':{'sha':'a'*40}}]) as api,patch.object(sync,'sync_branch',return_value=('sync/main-to-develop-aaaaaaaaaaaa','b'*40)),patch.object(sync,'command') as command:
             sync.run(args)
             self.assertEqual(api.call_count,3)
             command.assert_called_once_with('gh','workflow','run','ci.yml','--repo','pwngames/app','--ref','sync/main-to-develop-aaaaaaaaaaaa')
 
     def test_no_develop_branch_is_not_created(self):
         args=argparse.Namespace(run_id='',sha='a'*40,repository='unused',auto_merge=False)
-        with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',return_value=[{'name':'main'}]),patch.object(sync,'sync_branch') as branch:
+        with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=subprocess.CalledProcessError(1,['gh'],stderr='HTTP 404')),patch.object(sync,'sync_branch') as branch:
             sync.run(args)
             branch.assert_not_called()
 
@@ -88,3 +88,21 @@ class HistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'conflict'):
             sync.sync_branch(self.work,sync.git(self.work,'rev-parse','HEAD'))
         self.assertEqual(sync.git(self.work,'ls-remote','--heads','origin','refs/heads/sync/*'),'')
+
+
+class AdditionalSafetyTests(HistoryTests):
+    def test_existing_branch_with_manual_tree_change_is_rejected(self):
+        branch, head = sync.sync_branch(self.work, self.main)
+        (self.work/'surprise').write_text('unrelated change')
+        sync.git(self.work,'add','surprise')
+        sync.git(self.work,'commit','--amend','--no-edit')
+        # Fixture models someone modifying the automation-owned branch. The
+        # implementation itself never force pushes or repairs this condition.
+        sync.git(self.work,'push','--force','origin',branch)
+        with self.assertRaisesRegex(ValueError,'outside the history merge'):
+            sync.sync_branch(self.work,self.main)
+
+    def test_absent_protection_is_manual_only(self):
+        with patch.object(sync,'api',side_effect=[{'allow_auto_merge':True,'allow_merge_commit':True},subprocess.CalledProcessError(1,['gh'],stderr='HTTP 404')]),patch.object(sync,'command') as command:
+            self.assertFalse(sync.protected_auto_merge('pwngames/app',1,'a'*40))
+            command.assert_not_called()

@@ -135,8 +135,14 @@ def run(args):
     if sha is None:
         print('Not a verified production delivery; nothing to synchronize.')
         return
-    branches = api(f'repos/{repo}/branches?per_page=100')
-    if not any(item['name'] == 'develop' for item in branches):
+    try:
+        api(f'repos/{repo}/git/ref/heads/develop')
+        has_develop = True
+    except subprocess.CalledProcessError as error:
+        if '404' not in (error.stderr or ''):
+            raise
+        has_develop = False
+    if not has_develop:
         print('Repository has no develop branch; synchronization is not applicable.')
         return
     result = sync_branch(Path(args.repository), sha)
