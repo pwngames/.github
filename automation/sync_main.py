@@ -83,15 +83,29 @@ def sync_branch(repo, main_sha):
     if remote:
         git(repo, 'fetch', 'origin', branch)
         head = git(repo, 'rev-parse', 'FETCH_HEAD')
-        parents = git(repo, 'show', '-s', '--format=%P', head).split()
-        if len(parents) != 2 or parents[1] != main_sha:
-            raise ValueError('Existing sync branch has unexpected history; refusing to change it.')
-        if subprocess.run(['git', '-C', str(repo), 'merge-base', '--is-ancestor', parents[0], 'origin/develop'],
+        unique = git(repo, 'rev-list', head, '--not', 'origin/main', 'origin/develop').split()
+        for commit in unique:
+            parents = git(repo, 'show', '-s', '--format=%P', commit).split()
+            if len(parents) != 2:
+                raise ValueError('Existing sync branch contains unexpected non-merge history.')
+            expected = git(repo, 'merge-tree', '--write-tree', *parents)
+            if git(repo, 'rev-parse', commit + '^{tree}') != expected:
+                raise ValueError('Existing sync branch contains changes outside the history merge.')
+        if subprocess.run(['git', '-C', str(repo), 'merge-base', '--is-ancestor', main_sha, head],
                           capture_output=True).returncode:
-            raise ValueError('Existing sync branch is not based on develop.')
-        expected = git(repo, 'merge-tree', '--write-tree', *parents)
-        if git(repo, 'rev-parse', head + '^{tree}') != expected:
-            raise ValueError('Existing sync branch contains changes outside the history merge.')
+            raise ValueError('Existing sync branch does not include this main history.')
+        git(repo, 'checkout', '--detach', head)
+        git(repo, 'config', 'user.name', 'github-actions[bot]')
+        git(repo, 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
+        try:
+            git(repo, 'merge', '--no-ff', '--no-edit', '-m', 'chore: refresh sync with current develop', 'origin/develop')
+        except subprocess.CalledProcessError:
+            git(repo, 'merge', '--abort', check=False)
+            raise ValueError('Updated develop conflicts with synchronization; manual resolution is required.') from None
+        head = git(repo, 'rev-parse', 'HEAD')
+        if git(repo, 'ls-remote', 'origin', 'refs/heads/main').split()[0] != main_sha:
+            return None
+        git(repo, 'push', 'origin', 'HEAD:refs/heads/' + branch)
         return branch, head
     git(repo, 'checkout', '-b', branch, 'origin/develop')
     git(repo, 'config', 'user.name', 'github-actions[bot]')
@@ -130,8 +144,22 @@ def protected_auto_merge(repo, number, head):
 
 def run(args):
     repo = os.environ['GITHUB_REPOSITORY']
-    sha = (source_sha(repo, args.workflow, args.run_id, args.receipt) if args.run_id
-           else valid_sha(args.sha))
+    if args.find_production_run:
+        main = api(f'repos/{repo}/git/ref/heads/main')['object']['sha']
+        runs = api(f'repos/{repo}/actions/workflows/{args.workflow}/runs?status=success&per_page=100')['workflow_runs']
+        sha = None
+        for candidate in runs:
+            # Nested delivery workflows have default-branch metadata; their
+            # run-bound receipt is the only accepted production source proof.
+            if not args.receipt and candidate.get('head_sha') != main:
+                continue
+            proof = source_sha(repo, args.workflow, str(candidate['id']), args.receipt)
+            if proof == main:
+                sha = proof
+                break
+    else:
+        sha = (source_sha(repo, args.workflow, args.run_id, args.receipt) if args.run_id
+               else valid_sha(args.sha))
     if sha is None:
         print('Not a verified production delivery; nothing to synchronize.')
         return
@@ -179,4 +207,5 @@ if __name__ == '__main__':
     parser.add_argument('--sha', default='')
     parser.add_argument('--receipt', action='store_true')
     parser.add_argument('--auto-merge', action='store_true')
+    parser.add_argument('--find-production-run', action='store_true')
     run(parser.parse_args())

@@ -17,6 +17,9 @@ on:
       require-receipt:
         type: boolean
         default: false
+      find-production-run:
+        type: boolean
+        default: false
     secrets:
       sync-token:
         required: false
@@ -54,8 +57,10 @@ jobs:
           SOURCE_WORKFLOW: ${{ inputs.source-workflow }}
           SOURCE_RUN_ID: ${{ inputs.source-run-id }}
           SOURCE_SHA: ${{ inputs.source-sha }}
+          FIND_PRODUCTION_RUN: ${{ inputs.find-production-run }}
           REQUIRE_RECEIPT: ${{ inputs.require-receipt }}
         run: |
           arguments=(--workflow "$SOURCE_WORKFLOW" --run-id "$SOURCE_RUN_ID" --sha "$SOURCE_SHA" --auto-merge)
           if [[ "$REQUIRE_RECEIPT" == true ]]; then arguments+=(--receipt); fi
+          if [[ "$FIND_PRODUCTION_RUN" == true ]]; then arguments+=(--find-production-run); fi
           python3 sync-automation/automation/sync_main.py "${arguments[@]}"
