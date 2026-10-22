@@ -154,7 +154,7 @@ class OwnedApprovalTests(unittest.TestCase):
 
     def test_only_exact_owned_bot_run_is_approved(self):
         pull,run=self.fixtures()
-        with patch.object(sync,'api',side_effect=[pull,{'workflow_runs':[run]},pull,{}]) as api:
+        with patch.object(sync,'api',side_effect=[pull,{'workflow_runs':[run]},pull,{'object':{'sha':self.head}},{}]) as api:
             self.assertEqual(sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head),22)
             self.assertEqual(api.call_args.args,(f'repos/{self.repo}/actions/runs/22/approve','--method','POST'))
 
@@ -167,7 +167,7 @@ class OwnedApprovalTests(unittest.TestCase):
             self.assertEqual(api.call_count,2)
 
     def test_moved_or_foreign_pr_never_queries_or_approves_runs(self):
-        for key,value in [('sha','b'*40),('ref','foreign'),('repo',{'full_name':'fork/app'})]:
+        for key,value in [('ref','foreign'),('repo',{'full_name':'fork/app'})]:
             pull,run=self.fixtures();pull['head'][key]=value
             with patch.object(sync,'api',return_value=pull) as api,self.assertRaises(ValueError):
                 sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head)
@@ -189,6 +189,42 @@ class OwnedApprovalTests(unittest.TestCase):
 
     def test_head_moved_immediately_before_approval_is_rejected(self):
         pull,run=self.fixtures();moved={**pull,'head':{**pull['head'],'sha':'b'*40}}
-        with patch.object(sync,'api',side_effect=[pull,{'workflow_runs':[run]},moved]) as api,self.assertRaises(ValueError):
+        with patch.object(sync,'api',side_effect=[pull,{'workflow_runs':[run]},moved,{'object':{'sha':'b'*40}}]) as api,self.assertRaises(ValueError):
             sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head)
-        self.assertEqual(api.call_count,3)
+        self.assertEqual(api.call_count,4)
+
+
+    def test_cached_matching_pr_cannot_approve_a_moved_remote_head(self):
+        pull,run=self.fixtures()
+        with patch.object(sync,'api',side_effect=[pull,{'workflow_runs':[run]},pull,{'object':{'sha':'b'*40}}]) as api,self.assertRaises(ValueError):
+            sync.prepare_owned_pr_ci(self.repo,7,self.branch,self.head)
+        self.assertEqual(api.call_count,4)
+
+
+class HeadConvergenceTests(unittest.TestCase):
+    def fixtures(self):
+        return dict(state='open',head={'sha':'b'*40,'ref':'sync/main-to-develop-aaaaaaaaaaaa','repo':{'full_name':'pwngames/app'}},base={'ref':'develop'})
+
+    def test_stale_pr_metadata_waits_only_when_remote_is_expected_head(self):
+        stale=self.fixtures();current={**stale,'head':{**stale['head'],'sha':'a'*40}}
+        with patch.object(sync,'api',side_effect=[stale,{'object':{'sha':'a'*40}},current]) as api,patch('time.sleep') as sleep:
+            self.assertEqual(sync.read_owned_pull('pwngames/app',7,'sync/main-to-develop-aaaaaaaaaaaa','a'*40),current)
+            sleep.assert_called_once_with(2)
+            self.assertEqual(api.call_count,3)
+
+    def test_real_remote_movement_fails_without_waiting_or_approval(self):
+        with patch.object(sync,'api',side_effect=[self.fixtures(),{'object':{'sha':'c'*40}}]),patch('time.sleep') as sleep,self.assertRaises(ValueError):
+            sync.read_owned_pull('pwngames/app',7,'sync/main-to-develop-aaaaaaaaaaaa','a'*40)
+        sleep.assert_not_called()
+
+    def test_convergence_timeout_is_bounded_and_read_only(self):
+        with patch.object(sync,'api',side_effect=[self.fixtures(),{'object':{'sha':'a'*40}}]*2) as api,patch('time.sleep') as sleep,self.assertRaises(ValueError):
+            sync.read_owned_pull('pwngames/app',7,'sync/main-to-develop-aaaaaaaaaaaa','a'*40,attempts=2)
+        self.assertEqual(api.call_count,4)
+        sleep.assert_called_once_with(2)
+
+    def test_immutable_binding_changes_never_wait(self):
+        stale=self.fixtures();stale['base']['ref']='main'
+        with patch.object(sync,'api',return_value=stale) as api,patch('time.sleep') as sleep,self.assertRaises(ValueError):
+            sync.read_owned_pull('pwngames/app',7,'sync/main-to-develop-aaaaaaaaaaaa','a'*40)
+        api.assert_called_once();sleep.assert_not_called()
