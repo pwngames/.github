@@ -185,12 +185,35 @@ def source_checkout_valid(api, repo, run, receipt):
     # recorded event PR against the exact source-head commit association, then
     # verify both repositories and stable head. Current base SHA may advance.
     associated = api.get(f"repos/{repo}/commits/{run['head_sha']}/pulls?per_page=100")
-    if not isinstance(associated, list) or len(associated) >= 100 or not any(p.get("number") == number for p in associated):
+    if not isinstance(associated, list) or len(associated) >= 100:
         return False
     pr = api.get(f"repos/{repo}/pulls/{number}")
-    return (pr.get("number") == number and pr.get("head", {}).get("sha") == parents[1]["sha"]
-            and pr.get("head", {}).get("repo", {}).get("full_name") == repo
-            and pr.get("base", {}).get("repo", {}).get("full_name") == repo)
+    if not isinstance(pr, dict):
+        return False
+    head, base = pr.get("head"), pr.get("base")
+    if (type(pr.get("number")) is not int or pr["number"] != number
+            or not isinstance(head, dict) or head.get("sha") != parents[1]["sha"]
+            or not isinstance(base, dict)
+            or not isinstance(head.get("repo"), dict) or head["repo"].get("full_name") != repo
+            or not isinstance(base.get("repo"), dict) or base["repo"].get("full_name") != repo):
+        return False
+    if any(isinstance(p, dict) and p.get("number") == number for p in associated):
+        return True
+    # A promotion head can itself be another PR's merge commit. GitHub's
+    # commit association then names only that original PR, not this promotion.
+    # Corroborate the recorded PR through its immutable native merge result;
+    # squash/rebase, advanced bases and changed trees cannot satisfy this path.
+    merge_sha = pr.get("merge_commit_sha")
+    if pr.get("merged") is not True or not isinstance(merge_sha, str) or not HEX.fullmatch(merge_sha):
+        return False
+    merged = api.get(f"repos/{repo}/git/commits/{merge_sha}")
+    if not isinstance(merged, dict) or merged.get("sha") != merge_sha:
+        return False
+    merged_parents, merged_tree = merged.get("parents"), merged.get("tree")
+    return (isinstance(merged_tree, dict) and merged_tree.get("sha") == receipt["tree"]
+            and isinstance(merged_parents, list) and len(merged_parents) == 2
+            and all(isinstance(p, dict) for p in merged_parents)
+            and [p.get("sha") for p in merged_parents] == [p["sha"] for p in parents])
 
 
 def verify_proof(api, identity, run, artifact, receipt, kind="qualification"):
