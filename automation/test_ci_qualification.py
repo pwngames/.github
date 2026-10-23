@@ -374,6 +374,67 @@ class QualificationTests(unittest.TestCase):
         with patch.object(self.api, 'get', side_effect=lambda endpoint, **kwargs: [] if '/commits/' in endpoint and '/pulls?' in endpoint else FakeAPI.get(self.api, endpoint, **kwargs)):
             with self.assertRaises(ValueError): self.verify()
 
+    def promotion_case(self):
+        self.api.run.update(event='pull_request', head_sha=BASE, pull_requests=[])
+        self.api.receipt.update(source_event='pull_request', run_head_sha=BASE, source_pr={'number': 12, 'head': BASE, 'base': BLOB})
+        self.api.artifact['workflow_run']['head_sha'] = BASE
+        self.api.commit['parents'] = [{'sha': BLOB}, {'sha': BASE}]
+        pr = {'number': 12, 'merged': True, 'merge_commit_sha': IMPL,
+              'head': {'sha': BASE, 'repo': {'full_name': REPO}}, 'base': {'repo': {'full_name': REPO}}}
+        merged = {'sha': IMPL, 'tree': {'sha': TREE}, 'parents': [{'sha': BLOB}, {'sha': BASE}]}
+        original = self.api.get
+        def get(endpoint, raw=False):
+            if '/commits/' in endpoint and '/pulls?' in endpoint: return [{'number': 11}]
+            if endpoint.endswith('/pulls/12'): return pr
+            if endpoint.endswith('/git/commits/' + IMPL): return merged
+            return original(endpoint, raw=raw)
+        return pr, merged, get
+
+    def test_promotion_merge_commit_head_uses_exact_native_merge_equivalence(self):
+        pr, merged, get = self.promotion_case()
+        with patch.object(self.api, 'get', side_effect=get):
+            self.assertEqual(self.verify()['checkout_sha'], HEAD)
+
+    def test_native_equivalence_never_accepts_other_parent_count_order_base_or_tree(self):
+        for field, value in [('parents', []), ('parents', [{'sha': BASE}]),
+                             ('parents', [{'sha': BLOB}, {'sha': BASE}, {'sha': IMPL}]),
+                             ('parents', [{'sha': BASE}, {'sha': BLOB}]),
+                             ('parents', [{'sha': IMPL}, {'sha': BASE}]),
+                             ('parents', [{'sha': BLOB}, {'sha': HEAD}]),
+                             ('tree', {'sha': BASE}), ('sha', BASE),
+                             ('parents', None), ('parents', [None, {'sha': BASE}]), ('tree', None)]:
+            with self.subTest(field=field, value=value):
+                self.api = FakeAPI(); pr, merged, get = self.promotion_case(); merged[field] = value
+                with patch.object(self.api, 'get', side_effect=get):
+                    with self.assertRaises(ValueError): self.verify()
+
+    def test_native_equivalence_requires_own_repo_stable_head_and_literal_merged_true(self):
+        for field, value in [('merged', False), ('merged', 'true'), ('merged', 1), ('merge_commit_sha', None),
+                             ('merge_commit_sha', 'short'), ('number', 11), ('number', True),
+                             ('head', {'sha': HEAD, 'repo': {'full_name': REPO}}),
+                             ('head', {'sha': BASE, 'repo': {'full_name': 'foreign/repo'}}),
+                             ('base', {'repo': {'full_name': 'foreign/repo'}}), ('head', None), ('base', None)]:
+            with self.subTest(field=field, value=value):
+                self.api = FakeAPI(); pr, merged, get = self.promotion_case(); pr[field] = value
+                with patch.object(self.api, 'get', side_effect=get):
+                    with self.assertRaises(ValueError): self.verify()
+
+    def test_native_equivalence_does_not_accept_unavailable_or_truncated_corroboration(self):
+        for unavailable in ('association', 'pull', 'merge'):
+            with self.subTest(unavailable=unavailable):
+                self.api = FakeAPI(); pr, merged, get = self.promotion_case()
+                def broken(endpoint, raw=False):
+                    if ((unavailable == 'association' and '/commits/' in endpoint and '/pulls?' in endpoint)
+                            or (unavailable == 'pull' and endpoint.endswith('/pulls/12'))
+                            or (unavailable == 'merge' and endpoint.endswith('/git/commits/' + IMPL))):
+                        raise q.GitHubError('contents_read_http_404')
+                    return get(endpoint, raw=raw)
+                with patch.object(self.api, 'get', side_effect=broken):
+                    self.assertEqual(q.plan(self.api, IDENTITY, ['src/app.py'])['mode'], 'full')
+        self.api = FakeAPI(); pr, merged, get = self.promotion_case()
+        with patch.object(self.api, 'get', side_effect=lambda endpoint, raw=False: [{'number': 11}] * 100 if '/commits/' in endpoint and '/pulls?' in endpoint else get(endpoint, raw=raw)):
+            with self.assertRaises(ValueError): self.verify()
+
     def test_head_only_pr_checkout_cannot_qualify_merge_tree(self):
         self.api.run.update(event='pull_request', pull_requests=[])
         with self.assertRaises(ValueError): self.verify()
