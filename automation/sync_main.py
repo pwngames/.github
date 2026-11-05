@@ -85,6 +85,16 @@ def sync_branch(repo, main_sha):
     if subprocess.run(['git', '-C', str(repo), 'merge-base', '--is-ancestor', main_sha, 'origin/develop'],
                       capture_output=True).returncode == 0:
         return None
+    # History-only promotion commits are not product changes. Compute the normal
+    # merge before creating a branch: main can have a different tree from develop
+    # while its source changes are already present alongside newer develop work.
+    # Comparing only the two tip trees would miss that common case.
+    try:
+        merged_tree = git(repo, 'merge-tree', '--write-tree', 'origin/develop', main_sha)
+    except subprocess.CalledProcessError:
+        raise ValueError('Main/develop conflict: no branch was pushed; manual conflict resolution is required.') from None
+    if merged_tree == git(repo, 'rev-parse', 'origin/develop^{tree}'):
+        return None
     branch = 'sync/main-to-develop-' + main_sha[:12]
     remote = git(repo, 'ls-remote', '--heads', 'origin', 'refs/heads/' + branch)
     if remote:
@@ -393,7 +403,7 @@ def run(args):
         return emit_state('not_applicable')
     result = sync_branch(Path(args.repository), sha)
     if result is None:
-        print('Main is already included in develop, or a newer main superseded this delivery.')
+        print('No source changes need synchronization, or a newer main superseded this delivery.')
         current = api(f'repos/{repo}/git/ref/heads/main')['object']['sha']
         return emit_state('no_changes' if current == sha else 'superseded')
     branch, head = result
