@@ -7,13 +7,14 @@ permissions:
 jobs:
   synchronize:
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
-    uses: pwngames/.github/.github/workflows/sync-main-reusable.yml@796d389f1d338de87dd3cb716fabf98658b5f6d1
+    uses: pwngames/.github/.github/workflows/sync-main-reusable.yml@a268091a908f54291488f7e6c59f4c4d58996fb7
     permissions:
       contents: write
       pull-requests: write
       actions: write
+      checks: read
     with:
-      implementation-ref: 796d389f1d338de87dd3cb716fabf98658b5f6d1
+      implementation-ref: a268091a908f54291488f7e6c59f4c4d58996fb7
       find-production-run: ${{ github.event_name == 'push' && github.ref_name == 'develop' }}
       source-sha: ${{ github.sha }}
     secrets:
