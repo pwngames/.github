@@ -36,6 +36,13 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(api.call_count,3)
             command.assert_called_once_with('gh','workflow','run','ci.yml','--repo','pwngames/app','--ref','sync/main-to-develop-aaaaaaaaaaaa')
 
+    def test_no_content_sync_creates_no_pr_and_launches_no_ci(self):
+        args=argparse.Namespace(find_production_run=False,run_id='',sha='a'*40,repository='unused',auto_merge=True)
+        with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=[{'ref':'refs/heads/develop'},{'object':{'sha':'a'*40}}]) as api,patch.object(sync,'sync_branch',return_value=None),patch.object(sync,'command') as command,patch.object(sync,'prepare_owned_pr_ci') as ci,patch.object(sync,'protected_auto_merge') as merge:
+            self.assertEqual(sync.run(args)['state'],'no_changes')
+            self.assertEqual(api.call_count,2)
+            command.assert_not_called();ci.assert_not_called();merge.assert_not_called()
+
     def test_no_develop_branch_is_not_created(self):
         args=argparse.Namespace(find_production_run=False,run_id='',sha='a'*40,repository='unused',auto_merge=False)
         with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=subprocess.CalledProcessError(1,['gh'],stderr='HTTP 404')),patch.object(sync,'sync_branch') as branch:
@@ -66,6 +73,33 @@ class HistoryTests(unittest.TestCase):
         for name,sha in [('main',self.main),('develop',self.develop)]:
             self.assertEqual(sync.git(self.work,'ls-remote','origin','refs/heads/'+name).split()[0],sha)
         self.assertEqual(sync.sync_branch(self.work,self.main),(branch,head))
+
+    def test_identical_trees_with_different_history_do_not_publish(self):
+        sync.git(self.work, 'checkout', 'develop')
+        self.commit('release', 'release')
+        sync.git(self.work, 'push', 'origin', 'develop')
+        # Squash-equivalent source, neither main nor develop is the other's ancestor.
+        sync.git(self.work, 'checkout', 'main')
+        self.commit('feature', 'feature')
+        sync.git(self.work, 'push', 'origin', 'main')
+        main = sync.git(self.work, 'rev-parse', 'HEAD')
+        before = sync.git(self.work, 'rev-parse', 'HEAD')
+        self.assertEqual(sync.git(self.work, 'rev-parse', 'main^{tree}'), sync.git(self.work, 'rev-parse', 'origin/develop^{tree}'))
+        self.assertIsNone(sync.sync_branch(self.work, main))
+        self.assertEqual(sync.git(self.work, 'rev-parse', 'HEAD'), before)
+        self.assertEqual(sync.git(self.work, 'ls-remote', '--heads', 'origin', 'refs/heads/sync/*'), '')
+
+    def test_already_applied_main_changes_preserve_newer_develop_without_pr(self):
+        sync.git(self.work, 'checkout', 'develop')
+        self.commit('release', 'release')
+        self.commit('newer-feature', 'keep develop work')
+        sync.git(self.work, 'push', 'origin', 'develop')
+        before = sync.git(self.work, 'rev-parse', 'HEAD')
+        self.assertNotEqual(sync.git(self.work, 'rev-parse', 'main^{tree}'), sync.git(self.work, 'rev-parse', 'origin/develop^{tree}'))
+        self.assertIsNone(sync.sync_branch(self.work, self.main))
+        self.assertEqual(sync.git(self.work, 'rev-parse', 'HEAD'), before)
+        self.assertEqual((self.work/'newer-feature').read_text(), 'keep develop work')
+        self.assertEqual(sync.git(self.work, 'ls-remote', '--heads', 'origin', 'refs/heads/sync/*'), '')
 
     def test_stale_main_does_not_push(self):
         self.assertIsNone(sync.sync_branch(self.work,'a'*40))
