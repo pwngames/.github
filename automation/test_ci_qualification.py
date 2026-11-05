@@ -469,5 +469,202 @@ class QualificationTests(unittest.TestCase):
         with self.assertRaises(ValueError): q.record(self.api, IDENTITY, selected, outcomes, ['src/x'])
 
 
+
+
+class CurrentPRCheckoutTests(unittest.TestCase):
+    """A refreshed GitHub merge ref is evidence only with an authenticated binding."""
+    source_head, actual_base = '1' * 40, 'f' * 40
+
+    def setUp(self):
+        self.event = {'number': 12, 'pull_request': {'number': 12,
+            'base': {'sha': BASE, 'ref': 'develop', 'repo': {'full_name': REPO}},
+            'head': {'sha': self.source_head, 'ref': 'feature/example', 'repo': {'full_name': REPO}}}}
+        self.env = {'GITHUB_REF': 'refs/pull/12/merge', 'GITHUB_BASE_REF': 'develop', 'GITHUB_HEAD_REF': 'feature/example'}
+        # Both event and current REST PR base.sha deliberately retain the old value.
+        self.current = copy.deepcopy(self.event['pull_request'])
+        self.current['merge_commit_sha'] = HEAD
+        self.branch = {'ref': 'refs/heads/develop', 'object': {'type': 'commit', 'sha': self.actual_base}}
+        self.associated = [{'number': 12}]
+        self.comparison = {'status': 'ahead', 'ahead_by': 2, 'behind_by': 0,
+            'merge_base_commit': {'sha': BASE}, 'base_commit': {'sha': BASE}}
+        self.calls = []
+
+    def get(self, endpoint, raw=False):
+        self.calls.append(endpoint)
+        if endpoint.endswith('/pulls/12'): return self.current
+        if '/git/ref/' in endpoint: return self.branch
+        if '/commits/' in endpoint and '/pulls?' in endpoint: return self.associated
+        if '/compare/' in endpoint: return self.comparison
+        raise AssertionError(endpoint)
+
+    def validate(self, *, base=None, parents=None):
+        parents = parents or [HEAD, base or self.actual_base, self.source_head]
+        with patch.object(q, 'git', return_value=' '.join(parents)):
+            return q.validate_pr_checkout(self, IDENTITY, self.event, self.env)
+
+    def test_current_branch_and_native_merge_authenticate_stale_rest_and_event_base(self):
+        binding = self.validate()
+        self.assertEqual(binding['source_base'], self.actual_base)
+        self.assertEqual(binding['source_pr'], {'number': 12, 'base': self.actual_base, 'head': self.source_head, 'base_ref': 'develop'})
+        self.assertEqual(binding['source_event_base'], BASE)
+        self.assertEqual(self.current['base']['sha'], BASE)
+        self.assertEqual(len(self.calls), 4)
+
+    def test_unchanged_event_base_keeps_strict_historical_offline_validation(self):
+        self.current = None  # No live lookup is required for the original exact event merge.
+        binding = self.validate(base=BASE)
+        self.assertEqual(binding['source_base'], BASE)
+        self.assertEqual(binding['source_event_base'], BASE)
+        self.assertEqual(self.calls, [])
+
+    def test_event_repository_ref_number_head_and_two_parent_checks_fail_closed(self):
+        mutations = [
+            lambda: self.event.update(number=True),
+            lambda: self.event.update(pull_request=[]),
+            lambda: self.event['pull_request'].update(number=99),
+            lambda: self.event['pull_request'].update(base=None),
+            lambda: self.event['pull_request']['base'].update(sha=None),
+            lambda: self.event['pull_request']['head'].update(sha=[]),
+            lambda: self.event['pull_request']['head']['repo'].update(full_name='fork/example'),
+            lambda: self.event['pull_request']['base'].update(repo=[]),
+            lambda: self.event['pull_request']['base'].update(ref='develop/../main'),
+            lambda: self.event['pull_request']['head'].update(ref='feature/example.lock'),
+            lambda: self.env.update(GITHUB_REF='refs/pull/99/merge'),
+            lambda: self.env.update(GITHUB_BASE_REF='main'),
+            lambda: self.env.update(GITHUB_HEAD_REF='changed-head'),
+        ]
+        for mutate in mutations:
+            self.setUp(); mutate()
+            with self.subTest(mutate=mutations.index(mutate)), self.assertRaises(ValueError): self.validate(base=BASE)
+            self.assertEqual(self.calls, [])
+        self.setUp()
+        for parents in ([HEAD, BASE], [HEAD, BASE, self.source_head, BLOB], [TREE, BASE, self.source_head], [HEAD, BASE, BLOB]):
+            with self.subTest(parents=parents), self.assertRaises(ValueError): self.validate(parents=parents)
+            self.assertEqual(self.calls, [])
+
+    def test_live_pr_and_branch_ref_must_match_actual_checkout_not_old_rest_base(self):
+        mutations = [
+            lambda: setattr(self, 'current', []),
+            lambda: self.current.update(number=99),
+            lambda: self.current.update(merge_commit_sha=TREE),
+            lambda: self.current['head'].update(sha=BLOB),
+            lambda: self.current['head'].update(ref='different-head'),
+            lambda: self.current['base'].update(ref='main'),
+            lambda: self.current['head'].update(repo={'full_name': 'fork/example'}),
+            lambda: self.current['base'].update(repo=None),
+            lambda: setattr(self, 'branch', []),
+            lambda: self.branch.update(ref='refs/tags/develop'),
+            lambda: self.branch.update(object=None),
+            lambda: self.branch['object'].update(type='tag'),
+            lambda: self.branch['object'].update(sha=BASE),
+            lambda: self.branch['object'].update(sha=BLOB),
+        ]
+        for mutate in mutations:
+            self.setUp(); mutate()
+            with self.subTest(mutate=mutations.index(mutate)), self.assertRaises(ValueError): self.validate()
+
+    def test_missing_truncated_or_wrong_source_association_is_rejected(self):
+        for associated in (None, {}, [], [None], [{'number': 99}], [{'number': 12}] * 100):
+            self.setUp(); self.associated = associated
+            with self.subTest(associated=associated), self.assertRaises(ValueError): self.validate()
+
+    def test_unrelated_older_diverged_or_malformed_ancestry_is_rejected(self):
+        comparisons = [None, [], {},
+            {**self.comparison, 'status': 'behind'}, {**self.comparison, 'status': 'diverged'},
+            {**self.comparison, 'status': 'identical', 'ahead_by': 0},
+            {**self.comparison, 'merge_base_commit': {'sha': BLOB}},
+            {**self.comparison, 'base_commit': {'sha': BLOB}},
+            {**self.comparison, 'merge_base_commit': []}, {**self.comparison, 'base_commit': None},
+            {**self.comparison, 'ahead_by': True}, {**self.comparison, 'ahead_by': 0},
+            {**self.comparison, 'behind_by': 1}, {**self.comparison, 'behind_by': False}]
+        for comparison in comparisons:
+            self.comparison = comparison
+            with self.subTest(comparison=comparison), self.assertRaises(ValueError): self.validate()
+
+    def test_api_failure_is_terminal_and_keeps_diagnostic_content_free(self):
+        for suffix in ('/pulls/12', '/git/ref/heads/develop', '/pulls?per_page=100', f'/compare/{BASE}...{self.actual_base}'):
+            original = self.get
+            def failure(endpoint, raw=False):
+                if endpoint.endswith(suffix): raise q.GitHubError('contents_read_http_503')
+                return original(endpoint, raw)
+            with patch.object(self, 'get', side_effect=failure), self.assertRaises(q.GitHubError) as error:
+                self.validate()
+            self.assertEqual(str(error.exception), 'contents_read_http_503')
+
+    def test_record_validates_binding_once_for_both_receipts_and_keeps_consumer_compatible(self):
+        binding = self.validate()
+        self.calls = []
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            root = Path(directory)
+            event = root / 'event.json'; event.write_text(json.dumps(self.event))
+            env = {**self.env, 'CI_PLAN': json.dumps({'schema': 1, 'identity': IDENTITY, 'mode': 'full'}),
+                'CI_RESULTS': json.dumps({'plan': {'result': 'success'}, 'image': {'result': 'success'}, 'test': {'result': 'success'}}),
+                'GITHUB_EVENT_NAME': 'pull_request', 'GITHUB_EVENT_PATH': str(event), 'GITHUB_RUN_ID': '7',
+                'GITHUB_RUN_ATTEMPT': '1', 'RUNNER_TEMP': directory, 'GITHUB_OUTPUT': str(root/'outputs')}
+            with patch.dict(q.os.environ, env), patch.object(q, 'inputs', return_value=IDENTITY), \
+                 patch.object(q, 'local_identity', return_value=IDENTITY), patch.object(q, 'changed_paths', return_value=['src/x']), \
+                 patch.object(q, 'GitHub', return_value=self), patch.object(q, 'git', return_value=' '.join([HEAD, self.actual_base, self.source_head])), \
+                 patch.object(q.sys, 'argv', ['ci_qualification.py', 'record']):
+                q.main()
+            verdict = json.loads((root/'ci-verdict.json').read_text())
+            full = json.loads((root/'ci-qualification.json').read_text())
+            self.assertEqual(len(self.calls), 4)  # One immutable snapshot, not four lookups per output artifact.
+            for payload in (verdict, full):
+                for key, value in binding.items(): self.assertEqual(payload[key], value)
+            api = FakeAPI()
+            api.commit['parents'] = [{'sha': self.actual_base}, {'sha': self.source_head}]
+            api.run.update(event='pull_request', head_sha=self.source_head, pull_requests=[])
+            api.artifact['workflow_run']['head_sha'] = self.source_head
+            api.receipt = full
+            original = api.get
+            def consumer(endpoint, raw=False):
+                if endpoint.endswith('/pulls/12'): return self.current
+                if '/commits/' in endpoint and '/pulls?' in endpoint: return self.associated
+                return original(endpoint, raw)
+            with patch.object(api, 'get', side_effect=consumer):
+                self.assertEqual(q.verify_proof(api, IDENTITY, api.run, api.artifact, full)['checkout_sha'], HEAD)
+
+    def test_invalid_event_and_git_ref_shapes_are_rejected(self):
+        self.event = []
+        with self.assertRaises(ValueError): self.validate()
+        for value in (None, '', 'a//b', '.hidden', 'branch.', 'a/.hidden', 'branch.lock', 'private?value=secret'):
+            self.assertFalse(q.branch_ref(value))
+        self.assertTrue(q.branch_ref('release/2026.11-fix'))
+        self.assertEqual(q.api_stage('repos/owner/repo/git/ref/heads/develop'), 'contents_read')
+
+    def test_stale_base_cannot_hide_a_runtime_revert_as_documentation_only(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent.resolve()) as directory:
+            root = Path(directory); repo = root / 'repo'; repo.mkdir()
+            def command(*args):
+                return subprocess.check_output(['git', *args], cwd=repo, text=True, stderr=subprocess.DEVNULL).strip()
+            command('init', '-b', 'develop')
+            command('config', 'user.name', 'Synthetic fixture')
+            command('config', 'user.email', 'fixture@example.invalid')
+            (repo/'runtime.py').write_text('old runtime')
+            (repo/'docs').mkdir(); (repo/'docs/guide.md').write_text('old docs')
+            command('add', '.'); command('commit', '-m', 'Old event base')
+            old = command('rev-parse', 'HEAD')
+            (repo/'runtime.py').write_text('new runtime')
+            command('commit', '-am', 'Actual current base')
+            command('checkout', '-b', 'feature')
+            (repo/'runtime.py').write_text('old runtime')
+            (repo/'docs/guide.md').write_text('new docs')
+            command('commit', '-am', 'Runtime revert plus documentation')
+            command('checkout', 'develop'); command('merge', '--no-ff', 'feature', '-m', 'Synthetic merge')
+            self.assertEqual(command('diff', '--name-only', old, 'HEAD'), 'docs/guide.md')
+            event = root/'event.json'; event.write_text(json.dumps({'pull_request': {'base': {'sha': old}}}))
+            with patch.object(q, 'git', side_effect=command):
+                paths = q.changed_paths({'GITHUB_EVENT_NAME': 'pull_request', 'GITHUB_EVENT_PATH': str(event)})
+            self.assertIsNone(paths)
+            api = FakeAPI(); api.run['conclusion'] = 'failure'
+            self.assertEqual(q.plan(api, IDENTITY, paths)['mode'], 'full')
+
+    def test_original_exact_event_base_still_classifies_the_actual_diff(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as directory:
+            event = Path(directory)/'event.json'; event.write_text(json.dumps({'pull_request': {'base': {'sha': BASE}}}))
+            with patch.object(q, 'git', return_value=BASE), patch.object(q.subprocess, 'check_output', return_value=b'docs/guide.md\0'):
+                self.assertEqual(q.changed_paths({'GITHUB_EVENT_NAME': 'pull_request', 'GITHUB_EVENT_PATH': str(event)}), ['docs/guide.md'])
+
+
 if __name__ == '__main__':
     unittest.main()

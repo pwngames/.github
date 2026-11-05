@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import zipfile
+from urllib.parse import quote
 
 HEX = re.compile(r"[0-9a-f]{40}\Z")
 REPO = re.compile(r"[\w.-]+/[\w.-]+\Z")
@@ -42,7 +43,7 @@ def api_stage(endpoint):
         return "checks_read"
     if "/pulls" in endpoint:
         return "pull_requests_read"
-    if "/git/commits/" in endpoint or "/contents/" in endpoint or "/compare/" in endpoint:
+    if "/git/commits/" in endpoint or "/contents/" in endpoint or "/compare/" in endpoint or "/git/ref/" in endpoint:
         return "contents_read"
     if endpoint.endswith("/zip"):
         return "artifact_download"
@@ -140,6 +141,12 @@ def changed_paths(env=os.environ):
     else:
         return None
     if not HEX.fullmatch(base) or base == "0" * 40:
+        return None
+    # A refreshed PR merge ref may have a newer base than its event payload.
+    # A diff against that stale base can hide a runtime revert as docs-only.
+    # Unknown paths permit full checks or independently verified exact-tree reuse,
+    # never an unqualified documentation skip.
+    if env.get("GITHUB_EVENT_NAME") == "pull_request" and git("rev-parse", "HEAD^1") != base:
         return None
     # A missing shallow base or git failure means full validation.
     output = subprocess.check_output(["git", "diff", "--name-only", "-z", "--no-renames", base, "HEAD"], timeout=15)
@@ -383,6 +390,76 @@ def write_runtime_noop(identity, source_run, source_attempt, branch, env=os.envi
     return {"noop_file": str(target), "noop_artifact": "production-sync-receipt" if branch == "main" else "runtime-noop"}
 
 
+def branch_ref(value):
+    return (isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", value)
+            and not value.endswith(("/", ".")) and ".." not in value and "//" not in value
+            and all(not part.endswith(".lock") and not part.startswith(".") for part in value.split("/")))
+
+
+def validate_pr_checkout(api, identity, event, env=os.environ):
+    """Authenticate one actual PR merge binding, reused for both output receipts.
+
+    GitHub can refresh refs/pull/N/merge after the event and REST PR base.sha
+    were captured. Only the authenticated current branch ref plus GitHub's
+    exact server-side merge result may corroborate that newer first parent.
+    """
+    repo, checkout = identity["repository"], identity["checkout_sha"]
+    if not isinstance(event, dict):
+        raise ValueError("PR event identity is missing or inconsistent")
+    number, pr = event.get("number"), event.get("pull_request")
+    if type(number) is not int or number <= 0 or not isinstance(pr, dict) or type(pr.get("number")) is not int or pr.get("number") != number:
+        raise ValueError("PR event identity is missing or inconsistent")
+    base, head = pr.get("base"), pr.get("head")
+    if not isinstance(base, dict) or not isinstance(head, dict):
+        raise ValueError("PR event source identity is missing")
+    event_base, source_head = base.get("sha"), head.get("sha")
+    base_ref, head_ref = base.get("ref"), head.get("ref")
+    if (not isinstance(event_base, str) or not HEX.fullmatch(event_base)
+            or not isinstance(source_head, str) or not HEX.fullmatch(source_head)
+            or not branch_ref(base_ref) or not branch_ref(head_ref)
+            or env.get("GITHUB_REF") != f"refs/pull/{number}/merge"
+            or env.get("GITHUB_BASE_REF") != base_ref or env.get("GITHUB_HEAD_REF") != head_ref
+            or any(not isinstance(value.get("repo"), dict) or value["repo"].get("full_name") != repo for value in (head, base))):
+        raise ValueError("PR event must identify the exact own repository and refs")
+    parents = git("rev-list", "--parents", "-n", "1", "HEAD").split()
+    if (len(parents) != 3 or parents[0] != checkout or parents[2] != source_head
+            or any(not HEX.fullmatch(value) for value in parents)):
+        raise ValueError("Actual PR checkout must be the exact two-parent source merge")
+    actual_base = parents[1]
+    if actual_base != event_base:
+        current = api.get(f"repos/{repo}/pulls/{number}")
+        if not isinstance(current, dict) or type(current.get("number")) is not int or current.get("number") != number or current.get("merge_commit_sha") != checkout:
+            raise ValueError("Current PR merge result does not match the actual checkout")
+        current_base, current_head = current.get("base"), current.get("head")
+        if (not isinstance(current_base, dict) or not isinstance(current_head, dict)
+                or current_base.get("ref") != base_ref or current_head.get("ref") != head_ref
+                or current_head.get("sha") != source_head
+                or any(not isinstance(value.get("repo"), dict) or value["repo"].get("full_name") != repo for value in (current_head, current_base))):
+            raise ValueError("Current PR source repository, head or target ref changed")
+        live = api.get(f"repos/{repo}/git/ref/heads/{quote(base_ref, safe='/')}")
+        if (not isinstance(live, dict) or live.get("ref") != f"refs/heads/{base_ref}"
+                or not isinstance(live.get("object"), dict) or live["object"].get("type") != "commit"
+                or live["object"].get("sha") != actual_base):
+            raise ValueError("Actual PR first parent is not the authenticated current target branch")
+        associated = api.get(f"repos/{repo}/commits/{source_head}/pulls?per_page=100")
+        if (not isinstance(associated, list) or not associated or len(associated) >= 100
+                or any(not isinstance(row, dict) for row in associated)
+                or not any(type(row.get("number")) is int and row["number"] == number for row in associated)):
+            raise ValueError("Current PR source association is missing or truncated")
+        comparison = api.get(f"repos/{repo}/compare/{event_base}...{actual_base}")
+        if (not isinstance(comparison, dict) or comparison.get("status") != "ahead"
+                or not isinstance(comparison.get("merge_base_commit"), dict)
+                or comparison["merge_base_commit"].get("sha") != event_base
+                or not isinstance(comparison.get("base_commit"), dict)
+                or comparison["base_commit"].get("sha") != event_base
+                or type(comparison.get("ahead_by")) is not int or comparison["ahead_by"] <= 0
+                or type(comparison.get("behind_by")) is not int or comparison["behind_by"] != 0):
+            raise ValueError("Event PR base is not an authenticated ancestor of the tested base")
+    return {"run_head_sha": source_head, "source_base": actual_base,
+            "source_event_base": event_base,
+            "source_pr": {"number": number, "base": actual_base, "head": source_head, "base_ref": base_ref}}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("plan", "record", "verdict"))
@@ -412,24 +489,18 @@ def main():
         verdict = {"schema": 1, **identity, "mode": selected["mode"], "results": {job: results[job]["result"] for job in identity["expected_jobs"]}}
         if selected["mode"] == "docs":
             verdict["paths"] = paths
+        event_name = os.environ["GITHUB_EVENT_NAME"]
+        if event_name not in ("push", "pull_request", "workflow_dispatch"):
+            raise ValueError("Unsupported full qualification event")
+        event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+        source_binding = validate_pr_checkout(api, identity, event) if event_name == "pull_request" else {
+            "run_head_sha": identity["checkout_sha"], "source_base": event.get("before") if event_name == "push" else None}
         for name, payload_record in (("verdict", verdict), ("qualification", receipt)):
             if payload_record is None:
                 continue
             run = int(os.environ["GITHUB_RUN_ID"])
             attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
-            event_name = os.environ["GITHUB_EVENT_NAME"]
-            if event_name not in ("push", "pull_request", "workflow_dispatch"):
-                raise ValueError("Unsupported full qualification event")
-            payload_record.update(run_id=run, attempt=attempt, source_event=event_name, run_head_sha=identity["checkout_sha"])
-            event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-            payload_record["source_base"] = event.get("before") if event_name == "push" else event.get("pull_request", {}).get("base", {}).get("sha")
-            if event_name == "pull_request":
-                event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-                pr = event["pull_request"]
-                base, head = pr["base"]["sha"], pr["head"]["sha"]
-                if not HEX.fullmatch(base) or not HEX.fullmatch(head) or git("rev-parse", "HEAD^1") != base or git("rev-parse", "HEAD^2") != head:
-                    raise ValueError("Actual PR checkout must match both event merge parents")
-                payload_record.update(run_head_sha=head, source_pr={"number": event["number"], "base": base, "head": head})
+            payload_record.update(run_id=run, attempt=attempt, source_event=event_name, **source_binding)
             target = Path(os.environ["RUNNER_TEMP"]) / f"ci-{name}.json"
             payload = compact(payload_record)
             if len(payload.encode()) > MAX_RECEIPT:
