@@ -402,7 +402,7 @@ def run(args):
     if result is None:
         print('Main ancestry is already synchronized, or a newer main superseded this delivery.')
         current = api(f'repos/{repo}/git/ref/heads/main')['object']['sha']
-        return emit_state('no_changes' if current == sha else 'superseded')
+        return emit_state('no_changes' if current == sha else 'superseded', production_sha=sha)
     branch, head = result
     owner = repo.split('/')[0]
     pulls = api(f'repos/{repo}/pulls?state=open&base=develop&head={owner}:{branch}')
@@ -416,7 +416,7 @@ def run(args):
                    'body=Preserve the deployed main history in develop through a normal merge commit. '
                    'No manual source edits or protected-branch pushes. Required checks and reviews still apply.')
         number = pull['number']
-    details = {'pull_request_url': f'https://github.com/{repo}/pull/{number}', 'head_sha': head}
+    details = {'production_sha': sha, 'pull_request_url': f'https://github.com/{repo}/pull/{number}', 'head_sha': head}
     try:
         ci_run = prepare_owned_pr_ci(repo, number, branch, head)
     except ValueError:
