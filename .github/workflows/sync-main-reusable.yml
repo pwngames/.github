@@ -40,6 +40,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
+      production_sha: ${{ steps.synchronize.outputs.production_sha }}
       state: ${{ steps.synchronize.outputs.state }}
       pull_request_url: ${{ steps.synchronize.outputs.pull_request_url }}
       head_sha: ${{ steps.synchronize.outputs.head_sha }}
@@ -81,3 +82,33 @@ jobs:
           if [[ "$REQUIRE_RECEIPT" == true ]]; then arguments+=(--receipt); fi
           if [[ "$FIND_PRODUCTION_RUN" == true ]]; then arguments+=(--find-production-run); fi
           python3 sync-automation/automation/sync_main.py "${arguments[@]}"
+
+  verify-history:
+    needs: synchronize
+    if: needs.synchronize.outputs.state != 'not_applicable' && needs.synchronize.outputs.state != 'superseded'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Verify develop contains the deployed commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRODUCTION_SHA: ${{ needs.synchronize.outputs.production_sha }}
+          SYNC_STATE: ${{ needs.synchronize.outputs.state }}
+          SYNC_PR: ${{ needs.synchronize.outputs.pull_request_url }}
+        run: |
+          [[ "$PRODUCTION_SHA" =~ ^[0-9a-f]{40}$ ]]
+          while true; do
+            missing=$(gh api "repos/$GITHUB_REPOSITORY/compare/$PRODUCTION_SHA...develop" --jq '.behind_by')
+            if [[ "$missing" == 0 ]]; then
+              echo "Verified develop contains deployed commit $PRODUCTION_SHA."
+              break
+            fi
+            if [[ "$SYNC_STATE" != awaiting_checks || $(gh pr view "$SYNC_PR" --json state --jq .state) == CLOSED ]]; then
+              echo "::error::develop is missing $PRODUCTION_SHA (sync state $SYNC_STATE, PR $SYNC_PR)."
+              exit 1
+            fi
+            sleep 30
+          done

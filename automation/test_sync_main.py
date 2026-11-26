@@ -356,7 +356,7 @@ class OutcomeTests(unittest.TestCase):
     def test_run_queues_and_returns_truthful_state_without_completion_poll(self):
         with patch.dict(os.environ,{'GITHUB_REPOSITORY':'pwngames/app'}),patch.object(sync,'api',side_effect=[{},[{'number':7}],{'object':{'sha':'a'*40}}]),patch.object(sync,'sync_branch',return_value=('sync/main-to-develop-aaaaaaaaaaaa','b'*40)),patch.object(sync,'prepare_owned_pr_ci',return_value=sync.PreparedCI(22)),patch.object(sync,'verify_ci_launch') as proof,patch.object(sync,'protected_auto_merge',return_value='awaiting_checks') as native,patch('time.sleep') as sleep:
             result=sync.run(self.args())
-            self.assertEqual(result,{'state':'awaiting_checks','pull_request_url':'https://github.com/pwngames/app/pull/7','head_sha':'b'*40,'ci_run_id':22})
+            self.assertEqual(result,{'state':'awaiting_checks','production_sha':'a'*40,'pull_request_url':'https://github.com/pwngames/app/pull/7','head_sha':'b'*40,'ci_run_id':22})
             proof.assert_called_once_with('pwngames/app',7,'sync/main-to-develop-aaaaaaaaaaaa','b'*40,sync.PreparedCI(22))
             native.assert_called_once_with('pwngames/app',7,'sync/main-to-develop-aaaaaaaaaaaa','b'*40,main_sha='a'*40)
             sleep.assert_not_called()
